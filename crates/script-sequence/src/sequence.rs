@@ -1,4 +1,4 @@
-use crate::transaction::TransactionWithMetadata;
+ crate::transaction::TransactionWithMetadata;
 use alloy_network::AnyTransactionReceipt;
 use alloy_primitives::{hex, map::HashMap, TxHash};
 use eyre::{ContextCompat, Result, WrapErr};
