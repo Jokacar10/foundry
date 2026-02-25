@@ -1,5 +1,6 @@
 //! Runtime transport that connects on first request, which can take either of an HTTP,
-//! WebSocket, or IPC transport and supports retries based on CUPS logic.
+//! WebSocket, or IPC transport. Retries are handled by a client layer (e.g.,
+//! `RetryBackoffLayer`) when used.
 
 use crate::{DEFAULT_USER_AGENT, REQUEST_TIMEOUT};
 use alloy_json_rpc::{RequestPacket, ResponsePacket};
@@ -37,10 +38,6 @@ pub enum RuntimeTransportError {
     #[error("Internal transport error: {0} with {1}")]
     TransportError(TransportError, String),
 
-    /// Failed to lock the transport
-    #[error("Failed to lock the transport")]
-    LockError,
-
     /// Invalid URL scheme
     #[error("URL scheme is not supported: {0}")]
     BadScheme(String),
@@ -67,8 +64,9 @@ pub enum RuntimeTransportError {
 /// A runtime transport is a custom [`alloy_transport::Transport`] that only connects when the
 /// *first* request is made. When the first request is made, it will connect to the runtime using
 /// either an HTTP WebSocket, or IPC transport depending on the URL used.
-/// It also supports retries for rate-limiting and timeout-related errors.
-#[derive(Clone, Debug, Error)]
+/// Retries for rate-limiting and timeout-related errors are handled by an external
+/// client layer (e.g., `RetryBackoffLayer`) when configured.
+#[derive(Clone, Debug)]
 pub struct RuntimeTransport {
     /// The inner actual transport used.
     inner: Arc<RwLock<Option<InnerTransport>>>,
@@ -80,6 +78,10 @@ pub struct RuntimeTransport {
     jwt: Option<String>,
     /// The timeout for requests.
     timeout: std::time::Duration,
+    /// Whether to accept invalid certificates.
+    accept_invalid_certs: bool,
+    /// Whether to disable automatic proxy detection.
+    no_proxy: bool,
 }
 
 /// A builder for [RuntimeTransport].
@@ -89,12 +91,21 @@ pub struct RuntimeTransportBuilder {
     headers: Vec<String>,
     jwt: Option<String>,
     timeout: std::time::Duration,
+    accept_invalid_certs: bool,
+    no_proxy: bool,
 }
 
 impl RuntimeTransportBuilder {
     /// Create a new builder with the given URL.
     pub fn new(url: Url) -> Self {
-        Self { url, headers: vec![], jwt: None, timeout: REQUEST_TIMEOUT }
+        Self {
+            url,
+            headers: vec![],
+            jwt: None,
+            timeout: REQUEST_TIMEOUT,
+            accept_invalid_certs: false,
+            no_proxy: false,
+        }
     }
 
     /// Set the URL for the transport.
@@ -115,6 +126,21 @@ impl RuntimeTransportBuilder {
         self
     }
 
+    /// Set whether to accept invalid certificates.
+    pub fn accept_invalid_certs(mut self, accept_invalid_certs: bool) -> Self {
+        self.accept_invalid_certs = accept_invalid_certs;
+        self
+    }
+
+    /// Set whether to disable automatic proxy detection.
+    ///
+    /// This can help in sandboxed environments (e.g., Cursor IDE sandbox, macOS App Sandbox)
+    /// where system proxy detection via SCDynamicStore causes crashes.
+    pub fn no_proxy(mut self, no_proxy: bool) -> Self {
+        self.no_proxy = no_proxy;
+        self
+    }
+
     /// Builds the [RuntimeTransport] and returns it in a disconnected state.
     /// The runtime transport will then connect when the first request happens.
     pub fn build(self) -> RuntimeTransport {
@@ -124,6 +150,8 @@ impl RuntimeTransportBuilder {
             headers: self.headers,
             jwt: self.jwt,
             timeout: self.timeout,
+            accept_invalid_certs: self.accept_invalid_certs,
+            no_proxy: self.no_proxy,
         }
     }
 }
@@ -149,7 +177,16 @@ impl RuntimeTransport {
     pub fn reqwest_client(&self) -> Result<reqwest::Client, RuntimeTransportError> {
         let mut client_builder = reqwest::Client::builder()
             .timeout(self.timeout)
-            .tls_built_in_root_certs(self.url.scheme() == "https");
+            .tls_built_in_root_certs(self.url.scheme() == "https")
+            .danger_accept_invalid_certs(self.accept_invalid_certs);
+
+        // Disable automatic proxy detection if requested. This helps in sandboxed environments
+        // (e.g., Cursor IDE sandbox, macOS App Sandbox) where system proxy detection via
+        // SCDynamicStore causes crashes. See: https://github.com/foundry-rs/foundry/issues/12733
+        if self.no_proxy {
+            client_builder = client_builder.no_proxy();
+        }
+
         let mut headers = reqwest::header::HeaderMap::new();
 
         // If there's a JWT, add it to the headers if we can decode it.
@@ -222,8 +259,8 @@ impl RuntimeTransport {
 
     /// Sends a request using the underlying transport.
     /// If this is the first request, it will connect to the appropriate transport depending on the
-    /// URL scheme. When sending the request, retries will be automatically handled depending
-    /// on the parameters set on the [RuntimeTransport].
+    /// URL scheme. Retries are performed by an external client layer (e.g., `RetryBackoffLayer`),
+    /// if such a layer is configured by the caller.
     /// For sending the actual request, this action is delegated down to the
     /// underlying transport through Tower's [tower::Service::call]. See tower's [tower::Service]
     /// trait for more information.

@@ -39,7 +39,7 @@ use crate::{
 use alloy_primitives::{Address, TxHash};
 use alloy_rpc_types::txpool::TxpoolStatus;
 use anvil_core::eth::transaction::PendingTransaction;
-use futures::channel::mpsc::{channel, Receiver, Sender};
+use futures::channel::mpsc::{Receiver, Sender, channel};
 use parking_lot::{Mutex, RwLock};
 use std::{collections::VecDeque, fmt, sync::Arc};
 
@@ -75,7 +75,7 @@ impl Pool {
     /// Returns the number of tx that are ready and queued for further execution
     pub fn txpool_status(&self) -> TxpoolStatus {
         // Note: naming differs here compared to geth's `TxpoolStatus`
-        let pending: u64 = self.ready_transactions().count().try_into().unwrap_or(0);
+        let pending: u64 = self.inner.read().ready_transactions.len().try_into().unwrap_or(0);
         let queued: u64 = self.inner.read().pending_transactions.len().try_into().unwrap_or(0);
         TxpoolStatus { pending, queued }
     }
@@ -106,19 +106,17 @@ impl Pool {
         markers: impl IntoIterator<Item = TxMarker>,
     ) -> PruneResult {
         debug!(target: "txpool", ?block_number, "pruning transactions");
-        self.inner.write().prune_markers(markers)
+        let res = self.inner.write().prune_markers(markers);
+        for tx in &res.promoted {
+            self.notify_ready(tx);
+        }
+        res
     }
 
     /// Adds a new transaction to the pool
     pub fn add_transaction(&self, tx: PoolTransaction) -> Result<AddedTransaction, PoolError> {
         let added = self.inner.write().add_transaction(tx)?;
-        if let AddedTransaction::Ready(ref ready) = added {
-            self.notify_listener(ready.hash);
-            // also notify promoted transactions
-            for promoted in ready.promoted.iter().copied() {
-                self.notify_listener(promoted);
-            }
-        }
+        self.notify_ready(&added);
         Ok(added)
     }
 
@@ -170,6 +168,16 @@ impl Pool {
     pub fn clear(&self) {
         let mut pool = self.inner.write();
         pool.clear();
+    }
+
+    /// Notifies listeners if the transaction was added to the ready queue.
+    fn notify_ready(&self, tx: &AddedTransaction) {
+        if let AddedTransaction::Ready(ready) = tx {
+            self.notify_listener(ready.hash);
+            for promoted in ready.promoted.iter().copied() {
+                self.notify_listener(promoted);
+            }
+        }
     }
 
     /// notifies all listeners about the transaction
@@ -228,7 +236,7 @@ impl PoolInner {
     /// Returns `None` if the transaction does not exist in the pool
     fn get_transaction(&self, hash: TxHash) -> Option<PendingTransaction> {
         if let Some(pending) = self.pending_transactions.get(&hash) {
-            return Some(pending.transaction.pending_transaction.clone())
+            return Some(pending.transaction.pending_transaction.clone());
         }
         Some(
             self.ready_transactions.get(&hash)?.transaction.transaction.pending_transaction.clone(),
@@ -261,7 +269,7 @@ impl PoolInner {
     fn add_transaction(&mut self, tx: PoolTransaction) -> Result<AddedTransaction, PoolError> {
         if self.contains(&tx.hash()) {
             warn!(target: "txpool", "[{:?}] Already imported", tx.hash());
-            return Err(PoolError::AlreadyImported(Box::new(tx)))
+            return Err(PoolError::AlreadyImported(Box::new(tx)));
         }
 
         let tx = PendingPoolTransaction::new(tx, self.ready_transactions.provided_markers());
@@ -271,7 +279,7 @@ impl PoolInner {
         if !tx.is_ready() {
             let hash = tx.transaction.hash();
             self.pending_transactions.add_transaction(tx)?;
-            return Ok(AddedTransaction::Pending { hash })
+            return Ok(AddedTransaction::Pending { hash });
         }
         self.add_ready_transaction(tx)
     }
@@ -311,7 +319,7 @@ impl PoolInner {
                     if is_new_tx {
                         debug!(target: "txpool", "[{:?}] Failed to add tx: {:?}", current_hash,
         err);
-                        return Err(err)
+                        return Err(err);
                     } else {
                         ready.discarded.push(current_hash);
                     }
@@ -325,7 +333,7 @@ impl PoolInner {
         // the pending queue
         if ready.removed.iter().any(|tx| *tx.hash() == hash) {
             self.ready_transactions.clear_transactions(&ready.promoted);
-            return Err(PoolError::CyclicTransaction)
+            return Err(PoolError::CyclicTransaction);
         }
 
         Ok(AddedTransaction::Ready(ready))
@@ -366,7 +374,7 @@ impl PoolInner {
     pub fn remove_invalid(&mut self, tx_hashes: Vec<TxHash>) -> Vec<Arc<PoolTransaction>> {
         // early exit in case there is no invalid transactions.
         if tx_hashes.is_empty() {
-            return vec![]
+            return vec![];
         }
         trace!(target: "txpool", "Removing invalid transactions: {:?}", tx_hashes);
 
@@ -384,7 +392,7 @@ impl PoolInner {
             self.transactions_by_sender(sender).map(move |tx| tx.hash()).collect::<Vec<TxHash>>();
 
         if tx_hashes.is_empty() {
-            return vec![]
+            return vec![];
         }
 
         trace!(target: "txpool", "Removing transactions: {:?}", tx_hashes);

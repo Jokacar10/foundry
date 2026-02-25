@@ -7,20 +7,20 @@
 // the concrete `Executor` type.
 
 use crate::{
-    inspectors::{
-        cheatcodes::BroadcastableTransactions, Cheatcodes, InspectorData, InspectorStack,
-    },
     Env,
+    inspectors::{
+        Cheatcodes, InspectorData, InspectorStack, cheatcodes::BroadcastableTransactions,
+    },
 };
 use alloy_dyn_abi::{DynSolValue, FunctionExt, JsonAbiExt};
 use alloy_json_abi::Function;
 use alloy_primitives::{
-    keccak256,
+    Address, Bytes, Log, TxKind, U256, keccak256,
     map::{AddressHashMap, HashMap},
-    Address, Bytes, Log, TxKind, U256,
 };
-use alloy_sol_types::{sol, SolCall};
+use alloy_sol_types::{SolCall, sol};
 use foundry_evm_core::{
+    EvmEnv,
     backend::{Backend, BackendError, BackendResult, CowBackend, DatabaseExt, GLOBAL_FAIL_SLOT},
     constants::{
         CALLER, CHEATCODE_ADDRESS, CHEATCODE_CONTRACT_HASH, DEFAULT_CREATE2_DEPLOYER,
@@ -28,7 +28,6 @@ use foundry_evm_core::{
     },
     decode::{RevertDecoder, SkipReason},
     utils::StateChangeset,
-    EvmEnv, InspectorExt,
 };
 use foundry_evm_coverage::HitMaps;
 use foundry_evm_traces::{SparsedTraceArena, TraceMode};
@@ -40,11 +39,15 @@ use revm::{
         transaction::SignedAuthorization,
     },
     database::{DatabaseCommit, DatabaseRef},
-    interpreter::{return_ok, InstructionResult},
+    interpreter::{InstructionResult, return_ok},
     primitives::hardfork::SpecId,
 };
 use std::{
     borrow::Cow,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -57,8 +60,12 @@ pub use fuzz::FuzzedExecutor;
 pub mod invariant;
 pub use invariant::InvariantExecutor;
 
+mod corpus;
 mod trace;
+
 pub use trace::TracingExecutor;
+
+const DURATION_BETWEEN_METRICS_REPORT: Duration = Duration::from_secs(5);
 
 sol! {
     interface ITest {
@@ -84,11 +91,14 @@ sol! {
 #[derive(Clone, Debug)]
 pub struct Executor {
     /// The underlying `revm::Database` that contains the EVM storage.
+    ///
+    /// Wrapped in `Arc` for efficient cloning during parallel fuzzing. Use [`Arc::make_mut`]
+    /// for copy-on-write semantics when mutation is needed.
     // Note: We do not store an EVM here, since we are really
     // only interested in the database. REVM's `EVM` is a thin
     // wrapper around spawning a new EVM on every call anyway,
     // so the performance difference should be negligible.
-    backend: Backend,
+    backend: Arc<Backend>,
     /// The EVM environment.
     env: Env,
     /// The Revm inspector stack.
@@ -100,12 +110,6 @@ pub struct Executor {
 }
 
 impl Executor {
-    /// Creates a new `ExecutorBuilder`.
-    #[inline]
-    pub fn builder() -> ExecutorBuilder {
-        ExecutorBuilder::new()
-    }
-
     /// Creates a new `Executor` with the given arguments.
     #[inline]
     pub fn new(
@@ -128,7 +132,7 @@ impl Executor {
             },
         );
 
-        Self { backend, env, inspector, gas_limit, legacy_assertions }
+        Self { backend: Arc::new(backend), env, inspector, gas_limit, legacy_assertions }
     }
 
     fn clone_with_backend(&self, backend: Backend) -> Self {
@@ -138,7 +142,13 @@ impl Executor {
             self.env.tx.clone(),
             self.spec_id(),
         );
-        Self::new(backend, env, self.inspector().clone(), self.gas_limit, self.legacy_assertions)
+        Self {
+            backend: Arc::new(backend),
+            env,
+            inspector: self.inspector().clone(),
+            gas_limit: self.gas_limit,
+            legacy_assertions: self.legacy_assertions,
+        }
     }
 
     /// Returns a reference to the EVM backend.
@@ -147,8 +157,11 @@ impl Executor {
     }
 
     /// Returns a mutable reference to the EVM backend.
+    ///
+    /// Uses copy-on-write semantics: if other clones of this executor share the backend,
+    /// this will clone the backend first.
     pub fn backend_mut(&mut self) -> &mut Backend {
-        &mut self.backend
+        Arc::make_mut(&mut self.backend)
     }
 
     /// Returns a reference to the EVM environment.
@@ -313,7 +326,7 @@ impl Executor {
 
     #[inline]
     pub fn create2_deployer(&self) -> Address {
-        self.inspector().create2_deployer()
+        self.inspector().create2_deployer
     }
 
     /// Deploys a contract and commits the new state to the underlying database.
@@ -360,7 +373,7 @@ impl Executor {
         // persistent across fork swaps in forking mode
         self.backend_mut().add_persistent_account(address);
 
-        debug!(%address, "deployed contract");
+        trace!(%address, "deployed contract");
 
         Ok(DeployResult { raw: result, address })
     }
@@ -485,25 +498,41 @@ impl Executor {
         self.transact_with_env(env)
     }
 
+    /// Performs a raw call to an account on the current state of the VM with an EIP-7702
+    /// authorization last.
+    pub fn transact_raw_with_authorization(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        value: U256,
+        authorization_list: Vec<SignedAuthorization>,
+    ) -> eyre::Result<RawCallResult> {
+        let mut env = self.build_test_env(from, TxKind::Call(to), calldata, value);
+        env.tx.set_signed_authorization(authorization_list);
+        env.tx.tx_type = 4;
+        self.transact_with_env(env)
+    }
+
     /// Execute the transaction configured in `env.tx`.
     ///
     /// The state after the call is **not** persisted.
     #[instrument(name = "call", level = "debug", skip_all)]
     pub fn call_with_env(&self, mut env: Env) -> eyre::Result<RawCallResult> {
-        let mut inspector = self.inspector().clone();
+        let mut stack = self.inspector().clone();
         let mut backend = CowBackend::new_borrowed(self.backend());
-        let result = backend.inspect(&mut env, &mut inspector)?;
-        convert_executed_result(env, inspector, result, backend.has_state_snapshot_failure())
+        let result = backend.inspect(&mut env, stack.as_inspector())?;
+        convert_executed_result(env, stack, result, backend.has_state_snapshot_failure())
     }
 
     /// Execute the transaction configured in `env.tx`.
     #[instrument(name = "transact", level = "debug", skip_all)]
     pub fn transact_with_env(&mut self, mut env: Env) -> eyre::Result<RawCallResult> {
-        let mut inspector = self.inspector().clone();
+        let mut stack = self.inspector().clone();
         let backend = self.backend_mut();
-        let result = backend.inspect(&mut env, &mut inspector)?;
+        let result = backend.inspect(&mut env, stack.as_inspector())?;
         let mut result =
-            convert_executed_result(env, inspector, result, backend.has_state_snapshot_failure())?;
+            convert_executed_result(env, stack, result, backend.has_state_snapshot_failure())?;
         self.commit(&mut result);
         Ok(result)
     }
@@ -620,17 +649,16 @@ impl Executor {
         }
 
         // Check the global failure slot.
-        if let Some(acc) = state_changeset.get(&CHEATCODE_ADDRESS) {
-            if let Some(failed_slot) = acc.storage.get(&GLOBAL_FAIL_SLOT) {
-                if !failed_slot.present_value().is_zero() {
-                    return false;
-                }
-            }
+        if let Some(acc) = state_changeset.get(&CHEATCODE_ADDRESS)
+            && let Some(failed_slot) = acc.storage.get(&GLOBAL_FAIL_SLOT)
+            && !failed_slot.present_value().is_zero()
+        {
+            return false;
         }
-        if let Ok(failed_slot) = self.backend().storage_ref(CHEATCODE_ADDRESS, GLOBAL_FAIL_SLOT) {
-            if !failed_slot.is_zero() {
-                return false;
-            }
+        if let Ok(failed_slot) = self.backend().storage_ref(CHEATCODE_ADDRESS, GLOBAL_FAIL_SLOT)
+            && !failed_slot.is_zero()
+        {
+            return false;
         }
 
         if !self.legacy_assertions {
@@ -811,7 +839,7 @@ impl From<DeployResult> for RawCallResult {
 #[derive(Debug)]
 pub struct RawCallResult {
     /// The status of the call
-    pub exit_reason: InstructionResult,
+    pub exit_reason: Option<InstructionResult>,
     /// Whether the call reverted or not
     pub reverted: bool,
     /// Whether the call includes a snapshot failure
@@ -844,17 +872,18 @@ pub struct RawCallResult {
     /// The `revm::Env` after the call
     pub env: Env,
     /// The cheatcode states after execution
-    pub cheatcodes: Option<Cheatcodes>,
+    pub cheatcodes: Option<Box<Cheatcodes>>,
     /// The raw output of the execution
     pub out: Option<Output>,
     /// The chisel state
-    pub chisel_state: Option<(Vec<U256>, Vec<u8>, InstructionResult)>,
+    pub chisel_state: Option<(Vec<U256>, Vec<u8>)>,
+    pub reverter: Option<Address>,
 }
 
 impl Default for RawCallResult {
     fn default() -> Self {
         Self {
-            exit_reason: InstructionResult::Continue,
+            exit_reason: None,
             reverted: false,
             has_state_snapshot_failure: false,
             result: Bytes::new(),
@@ -872,6 +901,7 @@ impl Default for RawCallResult {
             cheatcodes: Default::default(),
             out: None,
             chisel_state: None,
+            reverter: None,
         }
     }
 }
@@ -886,20 +916,12 @@ impl RawCallResult {
         }
     }
 
-    /// Unpacks an execution result.
-    pub fn from_execution_result(r: Result<Self, ExecutionErr>) -> (Self, Option<String>) {
-        match r {
-            Ok(r) => (r, None),
-            Err(e) => (e.raw, Some(e.reason)),
-        }
-    }
-
     /// Converts the result of the call into an `EvmError`.
     pub fn into_evm_error(self, rd: Option<&RevertDecoder>) -> EvmError {
         if let Some(reason) = SkipReason::decode(&self.result) {
             return EvmError::Skip(reason);
         }
-        let reason = rd.unwrap_or_default().decode(&self.result, Some(self.exit_reason));
+        let reason = rd.unwrap_or_default().decode(&self.result, self.exit_reason);
         EvmError::Execution(Box::new(self.into_execution_error(reason)))
     }
 
@@ -910,7 +932,9 @@ impl RawCallResult {
 
     /// Returns an `EvmError` if the call failed, otherwise returns `self`.
     pub fn into_result(self, rd: Option<&RevertDecoder>) -> Result<Self, EvmError> {
-        if self.exit_reason.is_ok() {
+        if let Some(reason) = self.exit_reason
+            && reason.is_ok()
+        {
             Ok(self)
         } else {
             Err(self.into_evm_error(rd))
@@ -941,8 +965,9 @@ impl RawCallResult {
 
     /// Update provided history map with edge coverage info collected during this call.
     /// Uses AFL binning algo <https://github.com/h0mbre/Lucid/blob/3026e7323c52b30b3cf12563954ac1eaa9c6981e/src/coverage.rs#L57-L85>
-    pub fn merge_edge_coverage(&mut self, history_map: &mut [u8]) -> bool {
+    pub fn merge_edge_coverage(&mut self, history_map: &mut [u8]) -> (bool, bool) {
         let mut new_coverage = false;
+        let mut is_edge = false;
         if let Some(x) = &mut self.edge_coverage {
             // Iterate over the current map and the history map together and update
             // the history map, if we discover some new coverage, report true
@@ -964,6 +989,10 @@ impl RawCallResult {
 
                     // If the old record for this edge pair is lower, update
                     if *hist < bucket {
+                        if *hist == 0 {
+                            // Counts as an edge the first time we see it, otherwise it's a feature.
+                            is_edge = true;
+                        }
                         *hist = bucket;
                         new_coverage = true;
                     }
@@ -973,7 +1002,7 @@ impl RawCallResult {
                 }
             }
         }
-        new_coverage
+        (new_coverage, is_edge)
     }
 }
 
@@ -1042,6 +1071,7 @@ fn convert_executed_result(
         edge_coverage,
         cheatcodes,
         chisel_state,
+        reverter,
     } = inspector.collect();
 
     if logs.is_empty() {
@@ -1054,7 +1084,7 @@ fn convert_executed_result(
         .filter(|txs| !txs.is_empty());
 
     Ok(RawCallResult {
-        exit_reason,
+        exit_reason: Some(exit_reason),
         reverted: !matches!(exit_reason, return_ok!()),
         has_state_snapshot_failure,
         result,
@@ -1072,6 +1102,7 @@ fn convert_executed_result(
         cheatcodes,
         out,
         chisel_state,
+        reverter,
     })
 }
 
@@ -1086,8 +1117,46 @@ impl FuzzTestTimer {
         Self { inner: timeout.map(|timeout| (Instant::now(), Duration::from_secs(timeout.into()))) }
     }
 
+    /// Whether the fuzz test timer is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.inner.is_some()
+    }
+
     /// Whether the current fuzz test timed out and should be stopped.
     pub fn is_timed_out(&self) -> bool {
         self.inner.is_some_and(|(start, duration)| start.elapsed() > duration)
+    }
+}
+
+/// Helper struct to enable early exit behavior: when one test fails or run is interrupted,
+/// all other tests stop early.
+#[derive(Clone, Debug)]
+pub struct EarlyExit {
+    /// Shared atomic flag set to `true` when a failure occurs or ctrl-c received.
+    inner: Arc<AtomicBool>,
+    /// Whether to exit early on test failure (fail-fast mode).
+    fail_fast: bool,
+}
+
+impl EarlyExit {
+    pub fn new(fail_fast: bool) -> Self {
+        Self { inner: Arc::new(AtomicBool::new(false)), fail_fast }
+    }
+
+    /// Records a test failure. Only triggers early exit if fail-fast mode is enabled.
+    pub fn record_failure(&self) {
+        if self.fail_fast {
+            self.inner.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Records a Ctrl-C interrupt. Always triggers early exit.
+    pub fn record_ctrl_c(&self) {
+        self.inner.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether tests should stop and exit early.
+    pub fn should_stop(&self) -> bool {
+        self.inner.load(Ordering::Relaxed)
     }
 }

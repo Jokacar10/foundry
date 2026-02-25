@@ -1,41 +1,46 @@
+use super::run::fetch_contracts_bytecode_from_trace;
 use crate::{
+    Cast,
+    debug::handle_traces,
     traces::TraceKind,
     tx::{CastTxBuilder, SenderKind},
-    Cast,
 };
 use alloy_ens::NameOrAddress;
-use alloy_primitives::{Address, Bytes, TxKind, U256};
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256, hex, map::HashMap};
 use alloy_provider::Provider;
 use alloy_rpc_types::{
-    state::{StateOverride, StateOverridesBuilder},
     BlockId, BlockNumberOrTag, BlockOverrides,
+    state::{StateOverride, StateOverridesBuilder},
 };
 use clap::Parser;
 use eyre::Result;
 use foundry_cli::{
-    opts::{EthereumOpts, TransactionOpts},
-    utils::{self, handle_traces, parse_ether_value, TraceResult},
+    opts::{ChainValueParser, RpcOpts, TransactionOpts},
+    utils::{LoadConfig, TraceResult, get_provider, parse_ether_value},
 };
-use foundry_common::shell;
+use foundry_common::{
+    abi::{encode_function_args, get_func},
+    provider::curl_transport::generate_curl_command,
+    sh_println, shell,
+};
 use foundry_compilers::artifacts::EvmVersion;
 use foundry_config::{
+    Chain, Config,
     figment::{
-        self,
+        self, Metadata, Profile,
         value::{Dict, Map},
-        Figment, Metadata, Profile,
     },
-    Config,
 };
 use foundry_evm::{
     executors::TracingExecutor,
     opts::EvmOpts,
     traces::{InternalTraceMode, TraceMode},
 };
+use foundry_wallets::WalletOpts;
+use itertools::Either;
 use regex::Regex;
 use revm::context::TransactionType;
 use std::{str::FromStr, sync::LazyLock};
-
-use super::run::fetch_contracts_bytecode_from_trace;
 
 // matches override pattern <address>:<slot>:<value>
 // e.g. 0x123:0x1:0x1234
@@ -73,6 +78,7 @@ pub struct CallArgs {
     sig: Option<String>,
 
     /// The arguments of the function to call.
+    #[arg(allow_negative_numbers = true)]
     args: Vec<String>,
 
     /// Raw hex-encoded data for the transaction. Used instead of \[SIG\] and \[ARGS\].
@@ -86,11 +92,22 @@ pub struct CallArgs {
     #[arg(long, default_value_t = false)]
     trace: bool,
 
+    /// Disables the labels in the traces.
+    /// Can only be set with `--trace`.
+    #[arg(long, default_value_t = false, requires = "trace")]
+    disable_labels: bool,
+
     /// Opens an interactive debugger.
     /// Can only be used with `--trace`.
     #[arg(long, requires = "trace")]
     debug: bool,
 
+    /// Identify internal functions in traces.
+    ///
+    /// This will trace internal functions and decode stack parameters.
+    ///
+    /// Parameters stored in memory (such as bytes or arrays) are currently decoded only when a
+    /// single function is matched, similarly to `--debug`, for performance reasons.
     #[arg(long, requires = "trace")]
     decode_internal: bool,
 
@@ -110,10 +127,6 @@ pub struct CallArgs {
     #[arg(long, short)]
     block: Option<BlockId>,
 
-    /// Enable Odyssey features.
-    #[arg(long, alias = "alphanet")]
-    pub odyssey: bool,
-
     #[command(subcommand)]
     command: Option<CallSubcommands>,
 
@@ -121,35 +134,47 @@ pub struct CallArgs {
     tx: TransactionOpts,
 
     #[command(flatten)]
-    eth: EthereumOpts,
+    rpc: RpcOpts,
+
+    #[command(flatten)]
+    wallet: WalletOpts,
+
+    #[arg(
+        short,
+        long,
+        alias = "chain-id",
+        env = "CHAIN",
+        value_parser = ChainValueParser::default(),
+    )]
+    pub chain: Option<Chain>,
 
     /// Use current project artifacts for trace decoding.
     #[arg(long, visible_alias = "la")]
     pub with_local_artifacts: bool,
 
-    /// Override the balance of an account.
-    /// Format: address:balance
-    #[arg(long = "override-balance", value_name = "ADDRESS:BALANCE")]
+    /// Override the accounts balance.
+    /// Format: "address:balance,address:balance"
+    #[arg(long = "override-balance", value_name = "ADDRESS:BALANCE", value_delimiter = ',')]
     pub balance_overrides: Option<Vec<String>>,
 
-    /// Override the nonce of an account.
-    /// Format: address:nonce
-    #[arg(long = "override-nonce", value_name = "ADDRESS:NONCE")]
+    /// Override the accounts nonce.
+    /// Format: "address:nonce,address:nonce"
+    #[arg(long = "override-nonce", value_name = "ADDRESS:NONCE", value_delimiter = ',')]
     pub nonce_overrides: Option<Vec<String>>,
 
-    /// Override the code of an account.
-    /// Format: address:code
-    #[arg(long = "override-code", value_name = "ADDRESS:CODE")]
+    /// Override the accounts code.
+    /// Format: "address:code,address:code"
+    #[arg(long = "override-code", value_name = "ADDRESS:CODE", value_delimiter = ',')]
     pub code_overrides: Option<Vec<String>>,
 
-    /// Override the state of an account.
-    /// Format: address:slot:value
-    #[arg(long = "override-state", value_name = "ADDRESS:SLOT:VALUE")]
+    /// Override the accounts state and replace the current state entirely with the new one.
+    /// Format: "address:slot:value,address:slot:value"
+    #[arg(long = "override-state", value_name = "ADDRESS:SLOT:VALUE", value_delimiter = ',')]
     pub state_overrides: Option<Vec<String>>,
 
-    /// Override the state diff of an account.
-    /// Format: address:slot:value
-    #[arg(long = "override-state-diff", value_name = "ADDRESS:SLOT:VALUE")]
+    /// Override the accounts state specific slots and preserve the rest of the state.
+    /// Format: "address:slot:value,address:slot:value"
+    #[arg(long = "override-state-diff", value_name = "ADDRESS:SLOT:VALUE", value_delimiter = ',')]
     pub state_diff_overrides: Option<Vec<String>>,
 
     /// Override the block timestamp.
@@ -173,6 +198,7 @@ pub enum CallSubcommands {
         sig: Option<String>,
 
         /// The arguments of the constructor.
+        #[arg(allow_negative_numbers = true)]
         args: Vec<String>,
 
         /// Ether to send in the transaction.
@@ -187,7 +213,12 @@ pub enum CallSubcommands {
 
 impl CallArgs {
     pub async fn run(self) -> Result<()> {
-        let figment = Into::<Figment>::into(&self.eth).merge(&self);
+        // Handle --curl mode early, before any provider interaction
+        if self.rpc.curl {
+            return self.run_curl().await;
+        }
+
+        let figment = self.rpc.clone().into_figment(self.with_local_artifacts).merge(&self);
         let evm_opts = figment.extract::<EvmOpts>()?;
         let mut config = Config::from_provider(figment)?.sanitized();
         let state_overrides = self.get_state_overrides()?;
@@ -198,7 +229,6 @@ impl CallArgs {
             mut sig,
             mut args,
             mut tx,
-            eth,
             command,
             block,
             trace,
@@ -208,6 +238,8 @@ impl CallArgs {
             labels,
             data,
             with_local_artifacts,
+            disable_labels,
+            wallet,
             ..
         } = self;
 
@@ -215,8 +247,8 @@ impl CallArgs {
             sig = Some(data);
         }
 
-        let provider = utils::get_provider(&config)?;
-        let sender = SenderKind::from_wallet_opts(eth.wallet).await?;
+        let provider = get_provider(&config)?;
+        let sender = SenderKind::from_wallet_opts(wallet).await?;
         let from = sender.address();
 
         let code = if let Some(CallSubcommands::Create {
@@ -252,11 +284,12 @@ impl CallArgs {
             }
 
             let create2_deployer = evm_opts.create2_deployer;
-            let (mut env, fork, chain, odyssey) =
-                TracingExecutor::get_fork_material(&config, evm_opts).await?;
+            let (mut env, fork, chain, networks) =
+                TracingExecutor::get_fork_material(&mut config, evm_opts).await?;
 
             // modify settings that usually set in eth_call
             env.evm_env.cfg_env.disable_block_gas_limit = true;
+            env.evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
             env.evm_env.block_env.gas_limit = u64::MAX;
 
             // Apply the block overrides.
@@ -265,7 +298,7 @@ impl CallArgs {
                     env.evm_env.block_env.number = number.to();
                 }
                 if let Some(time) = block_overrides.time {
-                    env.evm_env.block_env.timestamp = time;
+                    env.evm_env.block_env.timestamp = U256::from(time);
                 }
             }
 
@@ -282,7 +315,7 @@ impl CallArgs {
                 fork,
                 evm_version,
                 trace_mode,
-                odyssey,
+                networks,
                 create2_deployer,
                 state_overrides,
             )?;
@@ -291,6 +324,31 @@ impl CallArgs {
             let input = tx.inner.input.into_input().unwrap_or_default();
             let tx_kind = tx.inner.to.expect("set by builder");
             let env_tx = &mut executor.env_mut().tx;
+
+            // Set transaction options with --trace
+            if let Some(gas_limit) = tx.inner.gas {
+                env_tx.gas_limit = gas_limit;
+            }
+
+            if let Some(gas_price) = tx.inner.gas_price {
+                env_tx.gas_price = gas_price;
+            }
+
+            if let Some(max_fee_per_gas) = tx.inner.max_fee_per_gas {
+                env_tx.gas_price = max_fee_per_gas;
+            }
+
+            if let Some(max_priority_fee_per_gas) = tx.inner.max_priority_fee_per_gas {
+                env_tx.gas_priority_fee = Some(max_priority_fee_per_gas);
+            }
+
+            if let Some(max_fee_per_blob_gas) = tx.inner.max_fee_per_blob_gas {
+                env_tx.max_fee_per_blob_gas = max_fee_per_blob_gas;
+            }
+
+            if let Some(nonce) = tx.inner.nonce {
+                env_tx.nonce = nonce;
+            }
 
             if let Some(tx_type) = tx.inner.transaction_type {
                 env_tx.tx_type = tx_type;
@@ -304,6 +362,12 @@ impl CallArgs {
                 }
             }
 
+            if let Some(auth) = tx.inner.authorization_list {
+                env_tx.authorization_list = auth.into_iter().map(Either::Left).collect();
+
+                env_tx.tx_type = TransactionType::Eip7702 as u8;
+            }
+
             let trace = match tx_kind {
                 TxKind::Create => {
                     let deploy_result = executor.deploy(from, input, value, None);
@@ -315,7 +379,7 @@ impl CallArgs {
                 ),
             };
 
-            let contracts_bytecode = fetch_contracts_bytecode_from_trace(&provider, &trace).await?;
+            let contracts_bytecode = fetch_contracts_bytecode_from_trace(&executor, &trace)?;
             handle_traces(
                 trace,
                 &config,
@@ -325,6 +389,8 @@ impl CallArgs {
                 with_local_artifacts,
                 debug,
                 decode_internal,
+                disable_labels,
+                None,
             )
             .await?;
 
@@ -335,16 +401,71 @@ impl CallArgs {
             .call(&tx, func.as_ref(), block, state_overrides, block_overrides)
             .await?;
 
-        if response == "0x" {
-            if let Some(contract_address) = tx.to.and_then(|tx_kind| tx_kind.into_to()) {
-                let code = provider.get_code_at(contract_address).await?;
-                if code.is_empty() {
-                    sh_warn!("Contract code is empty")?;
-                }
+        if response == "0x"
+            && let Some(contract_address) = tx.to.and_then(|tx_kind| tx_kind.into_to())
+        {
+            let code = provider.get_code_at(contract_address).await?;
+            if code.is_empty() {
+                sh_warn!("Contract code is empty")?;
             }
         }
         sh_println!("{}", response)?;
 
+        Ok(())
+    }
+
+    /// Handle --curl mode by generating curl command without any RPC interaction.
+    async fn run_curl(self) -> Result<()> {
+        let config = self.rpc.load_config()?;
+        let url = config.get_rpc_url_or_localhost_http()?;
+        let jwt = config.get_rpc_jwt_secret()?;
+
+        // Get call data - either from --data or from sig + args
+        let data = if let Some(data) = &self.data {
+            hex::decode(data)?
+        } else if let Some(sig) = &self.sig {
+            // If sig is already hex data, use it directly
+            if let Ok(data) = hex::decode(sig) {
+                data
+            } else {
+                // Parse function signature and encode args
+                let func = get_func(sig)?;
+                encode_function_args(&func, &self.args)?
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Resolve the destination address (must be a raw address for curl mode)
+        let to = self.to.as_ref().map(|n| match n {
+            NameOrAddress::Address(addr) => Ok(*addr),
+            NameOrAddress::Name(name) => {
+                eyre::bail!("ENS names are not supported with --curl. Please use a raw address instead of '{}'", name)
+            }
+        }).transpose()?;
+
+        // Build eth_call params
+        let call_object = serde_json::json!({
+            "to": to,
+            "data": format!("0x{}", hex::encode(&data)),
+        });
+
+        let block_param = self
+            .block
+            .map(|b| serde_json::to_value(b).unwrap_or(serde_json::json!("latest")))
+            .unwrap_or(serde_json::json!("latest"));
+
+        let params = serde_json::json!([call_object, block_param]);
+
+        let curl_cmd = generate_curl_command(
+            url.as_ref(),
+            "eth_call",
+            params,
+            config.eth_rpc_headers.as_deref(),
+            jwt.as_deref(),
+        );
+
+        sh_println!("{}", curl_cmd)?;
         Ok(())
     }
 
@@ -356,6 +477,7 @@ impl CallArgs {
             self.nonce_overrides.as_ref(),
             self.code_overrides.as_ref(),
             self.state_overrides.as_ref(),
+            self.state_diff_overrides.as_ref(),
         ]
         .iter()
         .all(Option::is_none)
@@ -386,18 +508,29 @@ impl CallArgs {
                 state_overrides_builder.with_code(addr.parse()?, Bytes::from_str(code_str)?);
         }
 
-        // Parse state overrides
-        for override_str in self.state_overrides.iter().flatten() {
-            let (addr, slot, value) = address_slot_value_override(override_str)?;
-            state_overrides_builder =
-                state_overrides_builder.with_state(addr, [(slot.into(), value.into())]);
+        type StateOverrides = HashMap<Address, HashMap<B256, B256>>;
+        let parse_state_overrides =
+            |overrides: &Option<Vec<String>>| -> Result<StateOverrides, eyre::Report> {
+                let mut state_overrides: StateOverrides = StateOverrides::default();
+
+                overrides.iter().flatten().try_for_each(|s| -> Result<(), eyre::Report> {
+                    let (addr, slot, value) = address_slot_value_override(s)?;
+                    state_overrides.entry(addr).or_default().insert(slot.into(), value.into());
+                    Ok(())
+                })?;
+
+                Ok(state_overrides)
+            };
+
+        // Parse and apply state overrides
+        for (addr, entries) in parse_state_overrides(&self.state_overrides)? {
+            state_overrides_builder = state_overrides_builder.with_state(addr, entries.into_iter());
         }
 
-        // Parse state diff overrides
-        for override_str in self.state_diff_overrides.iter().flatten() {
-            let (addr, slot, value) = address_slot_value_override(override_str)?;
+        // Parse and apply state diff overrides
+        for (addr, entries) in parse_state_overrides(&self.state_diff_overrides)? {
             state_overrides_builder =
-                state_overrides_builder.with_state_diff(addr, [(slot.into(), value.into())]);
+                state_overrides_builder.with_state_diff(addr, entries.into_iter())
         }
 
         Ok(Some(state_overrides_builder.build()))
@@ -412,11 +545,7 @@ impl CallArgs {
         if let Some(time) = self.block_time {
             overrides = overrides.with_time(time);
         }
-        if overrides.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(overrides))
-        }
+        if overrides.is_empty() { Ok(None) } else { Ok(Some(overrides)) }
     }
 }
 
@@ -427,10 +556,6 @@ impl figment::Provider for CallArgs {
 
     fn data(&self) -> Result<Map<Profile, Dict>, figment::Error> {
         let mut map = Map::new();
-
-        if self.odyssey {
-            map.insert("odyssey".into(), self.odyssey.into());
-        }
 
         if let Some(evm_version) = self.evm_version {
             map.insert("evm_version".into(), figment::value::Value::serialize(evm_version)?);
@@ -463,7 +588,115 @@ fn address_slot_value_override(address_override: &str) -> Result<(Address, U256,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::hex;
+    use alloy_primitives::{U64, address, b256, fixed_bytes};
+
+    #[test]
+    fn test_get_state_overrides() {
+        let call_args = CallArgs::parse_from([
+            "foundry-cli",
+            "--override-balance",
+            "0x0000000000000000000000000000000000000001:2",
+            "--override-nonce",
+            "0x0000000000000000000000000000000000000001:3",
+            "--override-code",
+            "0x0000000000000000000000000000000000000001:0x04",
+            "--override-state",
+            "0x0000000000000000000000000000000000000001:5:6",
+            "--override-state-diff",
+            "0x0000000000000000000000000000000000000001:7:8",
+        ]);
+        let overrides = call_args.get_state_overrides().unwrap().unwrap();
+        let address = address!("0x0000000000000000000000000000000000000001");
+        if let Some(account_override) = overrides.get(&address) {
+            if let Some(balance) = account_override.balance {
+                assert_eq!(balance, U256::from(2));
+            }
+            if let Some(nonce) = account_override.nonce {
+                assert_eq!(nonce, 3);
+            }
+            if let Some(code) = &account_override.code {
+                assert_eq!(*code, Bytes::from([0x04]));
+            }
+            if let Some(state) = &account_override.state
+                && let Some(value) = state.get(&b256!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000005"
+                ))
+            {
+                assert_eq!(
+                    *value,
+                    b256!("0x0000000000000000000000000000000000000000000000000000000000000006")
+                );
+            }
+            if let Some(state_diff) = &account_override.state_diff
+                && let Some(value) = state_diff.get(&b256!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000007"
+                ))
+            {
+                assert_eq!(
+                    *value,
+                    b256!("0x0000000000000000000000000000000000000000000000000000000000000008")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_state_overrides_empty() {
+        let call_args = CallArgs::parse_from([""]);
+        let overrides = call_args.get_state_overrides().unwrap();
+        assert_eq!(overrides, None);
+    }
+
+    #[test]
+    fn test_get_block_overrides() {
+        let mut call_args = CallArgs::parse_from([""]);
+        call_args.block_number = Some(1);
+        call_args.block_time = Some(2);
+        let overrides = call_args.get_block_overrides().unwrap().unwrap();
+        assert_eq!(overrides.number, Some(U256::from(1)));
+        assert_eq!(overrides.time, Some(2));
+    }
+
+    #[test]
+    fn test_get_block_overrides_empty() {
+        let call_args = CallArgs::parse_from([""]);
+        let overrides = call_args.get_block_overrides().unwrap();
+        assert_eq!(overrides, None);
+    }
+
+    #[test]
+    fn test_address_value_override_success() {
+        let text = "0x0000000000000000000000000000000000000001:2";
+        let (address, value) = address_value_override(text).unwrap();
+        assert_eq!(address, "0x0000000000000000000000000000000000000001");
+        assert_eq!(value, "2");
+    }
+
+    #[test]
+    fn test_address_value_override_error() {
+        let text = "invalid_value";
+        let error = address_value_override(text).unwrap_err();
+        assert_eq!(error.to_string(), "Invalid override invalid_value. Expected <address>:<value>");
+    }
+
+    #[test]
+    fn test_address_slot_value_override_success() {
+        let text = "0x0000000000000000000000000000000000000001:2:3";
+        let (address, slot, value) = address_slot_value_override(text).unwrap();
+        assert_eq!(*address, fixed_bytes!("0x0000000000000000000000000000000000000001"));
+        assert_eq!(slot, U256::from(2));
+        assert_eq!(value, U256::from(3));
+    }
+
+    #[test]
+    fn test_address_slot_value_override_error() {
+        let text = "invalid_value";
+        let error = address_slot_value_override(text).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid override invalid_value. Expected <address>:<slot>:<value>"
+        );
+    }
 
     #[test]
     fn can_parse_call_data() {
@@ -531,5 +764,54 @@ mod tests {
             args.state_overrides,
             Some(vec!["0x123:0x1:0x1234".to_string(), "0x456:0x2:0x5678".to_string()])
         );
+    }
+
+    #[test]
+    fn test_negative_args_with_flags() {
+        // Test that negative args work with flags
+        let args = CallArgs::parse_from([
+            "foundry-cli",
+            "--trace",
+            "0xDeaDBeeFcAfEbAbEfAcEfEeDcBaDbEeFcAfEbAbE",
+            "process(int256)",
+            "-999999",
+            "--debug",
+        ]);
+
+        assert!(args.trace);
+        assert!(args.debug);
+        assert_eq!(args.args, vec!["-999999"]);
+    }
+
+    #[test]
+    fn test_transaction_opts_with_trace() {
+        // Test that transaction options are correctly parsed when using --trace
+        let args = CallArgs::parse_from([
+            "foundry-cli",
+            "--trace",
+            "--gas-limit",
+            "1000000",
+            "--gas-price",
+            "20000000000",
+            "--priority-gas-price",
+            "2000000000",
+            "--nonce",
+            "42",
+            "--value",
+            "1000000000000000000", // 1 ETH
+            "--blob-gas-price",
+            "10000000000",
+            "0xDeaDBeeFcAfEbAbEfAcEfEeDcBaDbEeFcAfEbAbE",
+            "balanceOf(address)",
+            "0x123456789abcdef123456789abcdef123456789a",
+        ]);
+
+        assert!(args.trace);
+        assert_eq!(args.tx.gas_limit, Some(U256::from(1000000u32)));
+        assert_eq!(args.tx.gas_price, Some(U256::from(20000000000u64)));
+        assert_eq!(args.tx.priority_gas_price, Some(U256::from(2000000000u64)));
+        assert_eq!(args.tx.nonce, Some(U64::from(42)));
+        assert_eq!(args.tx.value, Some(U256::from(1000000000000000000u64)));
+        assert_eq!(args.tx.blob_gas_price, Some(U256::from(10000000000u64)));
     }
 }

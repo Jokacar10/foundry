@@ -1,6 +1,6 @@
 use crate::{ScriptSequence, TransactionWithMetadata};
 use alloy_network::AnyTransactionReceipt;
-use eyre::{bail, Result};
+use eyre::{Result, bail};
 use foundry_common::fs;
 use revm_inspectors::tracing::types::CallKind;
 use std::path::{Component, Path, PathBuf};
@@ -25,8 +25,8 @@ pub struct BroadcastReader {
 impl BroadcastReader {
     /// Create a new `BroadcastReader` instance.
     pub fn new(contract_name: String, chain_id: u64, broadcast_path: &Path) -> Result<Self> {
-        if !broadcast_path.exists() && !broadcast_path.is_dir() {
-            bail!("broadcast dir does not exist");
+        if !broadcast_path.is_dir() {
+            bail!("broadcast dir does not exist or is not a directory");
         }
 
         Ok(Self {
@@ -41,6 +41,12 @@ impl BroadcastReader {
     pub fn with_tx_type(mut self, tx_type: CallKind) -> Self {
         self.tx_type.push(tx_type);
         self
+    }
+
+    fn matches_filters(&self, tx: &TransactionWithMetadata) -> bool {
+        let name_filter = tx.contract_name.as_ref().is_some_and(|cn| *cn == self.contract_name);
+        let type_filter = self.tx_type.is_empty() || self.tx_type.contains(&tx.opcode);
+        name_filter && type_filter
     }
 
     /// Read all broadcast files in the broadcast directory.
@@ -113,19 +119,12 @@ impl BroadcastReader {
                     return false;
                 }
 
-                broadcast.transactions.iter().any(move |tx| {
-                    let name_filter =
-                        tx.contract_name.as_ref().is_some_and(|cn| *cn == self.contract_name);
-
-                    let type_filter = self.tx_type.is_empty() || self.tx_type.contains(&tx.opcode);
-
-                    name_filter && type_filter
-                })
+                broadcast.transactions.iter().any(|tx| self.matches_filters(tx))
             })
             .collect::<Vec<_>>();
 
         // Sort by descending timestamp
-        seqs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        seqs.sort_by_key(|s| std::cmp::Reverse(s.timestamp));
 
         seqs
     }
@@ -143,24 +142,11 @@ impl BroadcastReader {
         &self,
         broadcast: ScriptSequence,
     ) -> Vec<(TransactionWithMetadata, AnyTransactionReceipt)> {
-        let transactions = broadcast.transactions.clone();
-
-        let txs = transactions
-            .into_iter()
-            .filter(|tx| {
-                let name_filter =
-                    tx.contract_name.as_ref().is_some_and(|cn| *cn == self.contract_name);
-
-                let type_filter = self.tx_type.is_empty() || self.tx_type.contains(&tx.opcode);
-
-                name_filter && type_filter
-            })
-            .collect::<Vec<_>>();
+        let ScriptSequence { transactions, receipts, .. } = broadcast;
 
         let mut targets = Vec::new();
-        for tx in txs.into_iter() {
-            let maybe_receipt = broadcast
-                .receipts
+        for tx in transactions.into_iter().filter(|tx| self.matches_filters(tx)) {
+            let maybe_receipt = receipts
                 .iter()
                 .find(|receipt| tx.hash.is_some_and(|hash| hash == receipt.transaction_hash));
 
@@ -170,7 +156,7 @@ impl BroadcastReader {
         }
 
         // Sort by descending block number
-        targets.sort_by(|a, b| b.1.block_number.cmp(&a.1.block_number));
+        targets.sort_by_key(|t| std::cmp::Reverse(t.1.block_number));
 
         targets
     }

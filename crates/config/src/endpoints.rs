@@ -1,7 +1,7 @@
 //! Support for multiple RPC-endpoints
 
-use crate::resolve::{interpolate, UnresolvedEnvVarError, RE_PLACEHOLDER};
-use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
+use crate::resolve::{RE_PLACEHOLDER, UnresolvedEnvVarError, interpolate};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeMap};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -63,22 +63,6 @@ pub enum RpcEndpointType {
 }
 
 impl RpcEndpointType {
-    /// Returns the string variant
-    pub fn as_endpoint_string(&self) -> Option<&RpcEndpointUrl> {
-        match self {
-            Self::String(url) => Some(url),
-            Self::Config(_) => None,
-        }
-    }
-
-    /// Returns the config variant
-    pub fn as_endpoint_config(&self) -> Option<&RpcEndpoint> {
-        match self {
-            Self::Config(config) => Some(config),
-            Self::String(_) => None,
-        }
-    }
-
     /// Returns the url or config this type holds
     ///
     /// # Error
@@ -134,14 +118,6 @@ impl RpcEndpointUrl {
         match self {
             Self::Url(url) => Some(url),
             Self::Env(_) => None,
-        }
-    }
-
-    /// Returns the env variant
-    pub fn as_env(&self) -> Option<&str> {
-        match self {
-            Self::Env(val) => Some(val),
-            Self::Url(_) => None,
         }
     }
 
@@ -340,15 +316,15 @@ impl Serialize for RpcEndpoint {
     where
         S: Serializer,
     {
-        if self.config.retries.is_none() &&
-            self.config.retry_backoff.is_none() &&
-            self.config.compute_units_per_second.is_none() &&
-            self.auth.is_none()
+        if self.config.retries.is_none()
+            && self.config.retry_backoff.is_none()
+            && self.config.compute_units_per_second.is_none()
+            && self.auth.is_none()
         {
             // serialize as endpoint if there's no additional config
             self.endpoint.serialize(serializer)
         } else {
-            let mut map = serializer.serialize_map(Some(4))?;
+            let mut map = serializer.serialize_map(Some(5))?;
             map.serialize_entry("endpoint", &self.endpoint)?;
             map.serialize_entry("retries", &self.config.retries)?;
             map.serialize_entry("retry_backoff", &self.config.retry_backoff)?;
@@ -438,7 +414,7 @@ impl ResolvedRpcEndpoint {
     // Attempts to resolve unresolved environment variables into a new instance
     pub fn try_resolve(mut self) -> Self {
         if !self.is_unresolved() {
-            return self
+            return self;
         }
         if let Err(err) = self.endpoint {
             self.endpoint = err.try_resolve()

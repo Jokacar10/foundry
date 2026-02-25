@@ -1,8 +1,8 @@
 //! Commonly used constants.
 
-use alloy_consensus::Typed2718;
+use alloy_eips::Typed2718;
 use alloy_network::AnyTxEnvelope;
-use alloy_primitives::{address, Address, Signature, B256};
+use alloy_primitives::{Address, B256, Signature, address};
 use std::time::Duration;
 
 /// The dev chain-id, inherited from hardhat
@@ -39,6 +39,9 @@ pub const ARBITRUM_SENDER: Address = address!("0x0000000000000000000000000000000
 /// See also <https://github.com/ethereum-optimism/optimism/blob/65ec61dde94ffa93342728d324fecf474d228e1f/specs/deposits.md#l1-attributes-deposited-transaction>
 pub const OPTIMISM_SYSTEM_ADDRESS: Address = address!("0xdeaddeaddeaddeaddeaddeaddeaddeaddead0001");
 
+/// The system address, the sender of the first transaction in every block:
+pub const MONAD_SYSTEM_ADDRESS: Address = address!("0x6f49a8F621353f12378d0046E7d7e4b9B249DC9e");
+
 /// Transaction identifier of System transaction types
 pub const SYSTEM_TRANSACTION_TYPE: u8 = 126;
 
@@ -52,10 +55,10 @@ pub const TYPE_BINDING_PREFIX: &str = "string constant schema_";
 ///
 /// Transactions from these senders usually don't have a any fee information OR set absurdly high fees that exceed the gas limit (See: <https://github.com/foundry-rs/foundry/pull/10608>)
 ///
-/// See: [ARBITRUM_SENDER], [OPTIMISM_SYSTEM_ADDRESS] and [Address::ZERO]
-#[inline]
+/// See: [ARBITRUM_SENDER], [OPTIMISM_SYSTEM_ADDRESS], [MONAD_SYSTEM_ADDRESS] and [Address::ZERO]
 pub fn is_known_system_sender(sender: Address) -> bool {
-    [ARBITRUM_SENDER, OPTIMISM_SYSTEM_ADDRESS, Address::ZERO].contains(&sender)
+    [ARBITRUM_SENDER, OPTIMISM_SYSTEM_ADDRESS, MONAD_SYSTEM_ADDRESS, Address::ZERO]
+        .contains(&sender)
 }
 
 pub fn is_impersonated_tx(tx: &AnyTxEnvelope) -> bool {
@@ -68,8 +71,8 @@ pub fn is_impersonated_tx(tx: &AnyTxEnvelope) -> bool {
 pub fn is_impersonated_sig(sig: &Signature, ty: u8) -> bool {
     let impersonated_sig =
         Signature::from_scalars_and_parity(B256::with_last_byte(1), B256::with_last_byte(1), false);
-    if ty != SYSTEM_TRANSACTION_TYPE &&
-        (sig == &impersonated_sig || sig.r() == impersonated_sig.r())
+    if ty != SYSTEM_TRANSACTION_TYPE
+        && (sig == &impersonated_sig || sig.r() == impersonated_sig.r())
     {
         return true;
     }

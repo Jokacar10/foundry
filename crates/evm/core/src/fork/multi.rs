@@ -6,24 +6,25 @@
 use super::CreateFork;
 use crate::Env;
 use alloy_consensus::BlockHeader;
-use alloy_primitives::map::HashMap;
+use alloy_network::Network;
+use alloy_primitives::{U256, map::HashMap};
 use alloy_provider::network::BlockResponse;
-use foundry_common::provider::{ProviderBuilder, RetryProvider};
 use foundry_config::Config;
-use foundry_fork_db::{cache::BlockchainDbMeta, BackendHandler, BlockchainDb, SharedBackend};
+use foundry_fork_db::{BackendHandler, BlockchainDb, SharedBackend, cache::BlockchainDbMeta};
 use futures::{
-    channel::mpsc::{channel, Receiver, Sender},
-    stream::{Fuse, Stream},
+    FutureExt, StreamExt,
+    channel::mpsc::{Receiver, Sender, channel},
+    stream::Fuse,
     task::{Context, Poll},
-    Future, FutureExt, StreamExt,
 };
+use revm::context::BlockEnv;
 use std::{
     fmt::{self, Write},
     pin::Pin,
     sync::{
-        atomic::AtomicUsize,
-        mpsc::{channel as oneshot_channel, Sender as OneshotSender},
         Arc,
+        atomic::AtomicUsize,
+        mpsc::{Sender as OneshotSender, channel as oneshot_channel},
     },
     time::Duration,
 };
@@ -67,39 +68,47 @@ impl<T: Into<String>> From<T> for ForkId {
 /// Can send requests to the `MultiForkHandler` to create forks.
 #[derive(Clone, Debug)]
 #[must_use]
-pub struct MultiFork {
+pub struct MultiFork<N: Network> {
     /// Channel to send `Request`s to the handler.
-    handler: Sender<Request>,
+    handler: Sender<Request<N>>,
     /// Ensures that all rpc resources get flushed properly.
-    _shutdown: Arc<ShutDownMultiFork>,
+    _shutdown: Arc<ShutDownMultiFork<N>>,
 }
 
-impl MultiFork {
+impl<N: Network> MultiFork<N> {
     /// Creates a new pair and spawns the `MultiForkHandler` on a background thread.
     pub fn spawn() -> Self {
         trace!(target: "fork::multi", "spawning multifork");
 
         let (fork, mut handler) = Self::new();
-        // Spawn a light-weight thread with a thread-local async runtime just for
-        // sending and receiving data from the remote client(s).
-        std::thread::Builder::new()
-            .name("multi-fork-backend".into())
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to build tokio runtime");
 
-                rt.block_on(async move {
-                    // Flush cache every 60s, this ensures that long-running fork tests get their
-                    // cache flushed from time to time.
-                    // NOTE: we install the interval here because the `tokio::timer::Interval`
-                    // requires a rt.
-                    handler.set_flush_cache_interval(Duration::from_secs(60));
-                    handler.await
-                });
-            })
-            .expect("failed to spawn thread");
+        // Spawn a light-weight thread just for sending and receiving data from the remote
+        // client(s).
+        let fut = async move {
+            // Flush cache every 60s, this ensures that long-running fork tests get their
+            // cache flushed from time to time.
+            // NOTE: we install the interval here because the `tokio::timer::Interval`
+            // requires a rt.
+            handler.set_flush_cache_interval(Duration::from_secs(60));
+            handler.await
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => _ = rt.spawn(fut),
+            Err(_) => {
+                trace!(target: "fork::multi", "spawning multifork backend thread");
+                _ = std::thread::Builder::new()
+                    .name("multi-fork-backend".into())
+                    .spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("failed to build tokio runtime")
+                            .block_on(fut)
+                    })
+                    .expect("failed to spawn thread")
+            }
+        }
+
         trace!(target: "fork::multi", "spawned MultiForkHandler thread");
         fork
     }
@@ -108,7 +117,7 @@ impl MultiFork {
     ///
     /// Use [`spawn`](Self::spawn) instead.
     #[doc(hidden)]
-    pub fn new() -> (Self, MultiForkHandler) {
+    pub fn new() -> (Self, MultiForkHandler<N>) {
         let (handler, handler_rx) = channel(1);
         let _shutdown = Arc::new(ShutDownMultiFork { handler: Some(handler.clone()) });
         (Self { handler, _shutdown }, MultiForkHandler::new(handler_rx))
@@ -117,7 +126,7 @@ impl MultiFork {
     /// Returns a fork backend.
     ///
     /// If no matching fork backend exists it will be created.
-    pub fn create_fork(&self, fork: CreateFork) -> eyre::Result<(ForkId, SharedBackend, Env)> {
+    pub fn create_fork(&self, fork: CreateFork) -> eyre::Result<(ForkId, SharedBackend<N>, Env)> {
         trace!("Creating new fork, url={}, block={:?}", fork.url, fork.evm_opts.fork_block_number);
         let (sender, rx) = oneshot_channel();
         let req = Request::CreateFork(Box::new(fork), sender);
@@ -132,7 +141,7 @@ impl MultiFork {
         &self,
         fork: ForkId,
         block: u64,
-    ) -> eyre::Result<(ForkId, SharedBackend, Env)> {
+    ) -> eyre::Result<(ForkId, SharedBackend<N>, Env)> {
         trace!(?fork, ?block, "rolling fork");
         let (sender, rx) = oneshot_channel();
         let req = Request::RollFork(fork, block, sender);
@@ -150,7 +159,7 @@ impl MultiFork {
     }
 
     /// Updates block number and timestamp of given fork with new values.
-    pub fn update_block(&self, fork: ForkId, number: u64, timestamp: u64) -> eyre::Result<()> {
+    pub fn update_block(&self, fork: ForkId, number: U256, timestamp: U256) -> eyre::Result<()> {
         trace!(?fork, ?number, ?timestamp, "update fork block");
         self.handler
             .clone()
@@ -158,10 +167,22 @@ impl MultiFork {
             .map_err(|e| eyre::eyre!("{:?}", e))
     }
 
+    /// Updates the fork's entire env
+    ///
+    /// This is required for tx level forking where we need to fork off the `block - 1` state but
+    /// still need use env settings for `env`.
+    pub fn update_block_env(&self, fork: ForkId, env: BlockEnv) -> eyre::Result<()> {
+        trace!(?fork, ?env, "update fork block");
+        self.handler
+            .clone()
+            .try_send(Request::UpdateEnv(fork, env))
+            .map_err(|e| eyre::eyre!("{:?}", e))
+    }
+
     /// Returns the corresponding fork if it exists.
     ///
     /// Returns `None` if no matching fork backend is available.
-    pub fn get_fork(&self, id: impl Into<ForkId>) -> eyre::Result<Option<SharedBackend>> {
+    pub fn get_fork(&self, id: impl Into<ForkId>) -> eyre::Result<Option<SharedBackend<N>>> {
         let id = id.into();
         trace!(?id, "get fork backend");
         let (sender, rx) = oneshot_channel();
@@ -181,63 +202,63 @@ impl MultiFork {
     }
 }
 
-type Handler = BackendHandler<Arc<RetryProvider>>;
-
-type CreateFuture =
-    Pin<Box<dyn Future<Output = eyre::Result<(ForkId, CreatedFork, Handler)>> + Send>>;
-type CreateSender = OneshotSender<eyre::Result<(ForkId, SharedBackend, Env)>>;
+type CreateFuture<N> =
+    Pin<Box<dyn Future<Output = eyre::Result<(ForkId, CreatedFork<N>, BackendHandler<N>)>> + Send>>;
+type CreateSender<N> = OneshotSender<eyre::Result<(ForkId, SharedBackend<N>, Env)>>;
 type GetEnvSender = OneshotSender<Option<Env>>;
 
 /// Request that's send to the handler.
 #[derive(Debug)]
-enum Request {
+enum Request<N: Network> {
     /// Creates a new ForkBackend.
-    CreateFork(Box<CreateFork>, CreateSender),
+    CreateFork(Box<CreateFork>, CreateSender<N>),
     /// Returns the Fork backend for the `ForkId` if it exists.
-    GetFork(ForkId, OneshotSender<Option<SharedBackend>>),
+    GetFork(ForkId, OneshotSender<Option<SharedBackend<N>>>),
     /// Adjusts the block that's being forked, by creating a new fork at the new block.
-    RollFork(ForkId, u64, CreateSender),
+    RollFork(ForkId, u64, CreateSender<N>),
     /// Returns the environment of the fork.
     GetEnv(ForkId, GetEnvSender),
     /// Updates the block number and timestamp of the fork.
-    UpdateBlock(ForkId, u64, u64),
+    UpdateBlock(ForkId, U256, U256),
+    /// Updates the block the entire block env,
+    UpdateEnv(ForkId, BlockEnv),
     /// Shutdowns the entire `MultiForkHandler`, see `ShutDownMultiFork`
     ShutDown(OneshotSender<()>),
     /// Returns the Fork Url for the `ForkId` if it exists.
     GetForkUrl(ForkId, OneshotSender<Option<String>>),
 }
 
-enum ForkTask {
+enum ForkTask<N: Network> {
     /// Contains the future that will establish a new fork.
-    Create(CreateFuture, ForkId, CreateSender, Vec<CreateSender>),
+    Create(CreateFuture<N>, ForkId, CreateSender<N>, Vec<CreateSender<N>>),
 }
 
 /// The type that manages connections in the background.
 #[must_use = "futures do nothing unless polled"]
-pub struct MultiForkHandler {
+pub struct MultiForkHandler<N: Network> {
     /// Incoming requests from the `MultiFork`.
-    incoming: Fuse<Receiver<Request>>,
+    incoming: Fuse<Receiver<Request<N>>>,
 
     /// All active handlers.
     ///
     /// It's expected that this list will be rather small (<10).
-    handlers: Vec<(ForkId, Handler)>,
+    handlers: Vec<(ForkId, BackendHandler<N>)>,
 
     // tasks currently in progress
-    pending_tasks: Vec<ForkTask>,
+    pending_tasks: Vec<ForkTask<N>>,
 
     /// All _unique_ forkids mapped to their corresponding backend.
     ///
     /// Note: The backend can be shared by multiple ForkIds if the target the same provider and
     /// block number.
-    forks: HashMap<ForkId, CreatedFork>,
+    forks: HashMap<ForkId, CreatedFork<N>>,
 
     /// Optional periodic interval to flush rpc cache.
     flush_cache_interval: Option<tokio::time::Interval>,
 }
 
-impl MultiForkHandler {
-    fn new(incoming: Receiver<Request>) -> Self {
+impl<N: Network> MultiForkHandler<N> {
+    fn new(incoming: Receiver<Request<N>>) -> Self {
         Self {
             incoming: incoming.fuse(),
             handlers: Default::default(),
@@ -255,19 +276,18 @@ impl MultiForkHandler {
     }
 
     /// Returns the list of additional senders of a matching task for the given id, if any.
-    #[expect(irrefutable_let_patterns)]
-    fn find_in_progress_task(&mut self, id: &ForkId) -> Option<&mut Vec<CreateSender>> {
+    fn find_in_progress_task(&mut self, id: &ForkId) -> Option<&mut Vec<CreateSender<N>>> {
         for task in &mut self.pending_tasks {
-            if let ForkTask::Create(_, in_progress, _, additional) = task {
-                if in_progress == id {
-                    return Some(additional);
-                }
+            if let ForkTask::Create(_, in_progress, _, additional) = task
+                && in_progress == id
+            {
+                return Some(additional);
             }
         }
         None
     }
 
-    fn create_fork(&mut self, fork: CreateFork, sender: CreateSender) {
+    fn create_fork(&mut self, fork: CreateFork, sender: CreateSender<N>) {
         let fork_id = ForkId::new(&fork.url, fork.evm_opts.fork_block_number);
         trace!(?fork_id, "created new forkId");
 
@@ -285,9 +305,9 @@ impl MultiForkHandler {
     fn insert_new_fork(
         &mut self,
         fork_id: ForkId,
-        fork: CreatedFork,
-        sender: CreateSender,
-        additional_senders: Vec<CreateSender>,
+        fork: CreatedFork<N>,
+        sender: CreateSender<N>,
+        additional_senders: Vec<CreateSender<N>>,
     ) {
         self.forks.insert(fork_id.clone(), fork.clone());
         let _ = sender.send(Ok((fork_id.clone(), fork.backend.clone(), fork.opts.env.clone())));
@@ -300,16 +320,22 @@ impl MultiForkHandler {
         }
     }
 
+    /// Update the fork's block entire env
+    fn update_env(&mut self, fork_id: ForkId, env: BlockEnv) {
+        if let Some(fork) = self.forks.get_mut(&fork_id) {
+            fork.opts.env.evm_env.block_env = env;
+        }
+    }
     /// Update fork block number and timestamp. Used to preserve values set by `roll` and `warp`
     /// cheatcodes when new fork selected.
-    fn update_block(&mut self, fork_id: ForkId, block_number: u64, block_timestamp: u64) {
+    fn update_block(&mut self, fork_id: ForkId, block_number: U256, block_timestamp: U256) {
         if let Some(fork) = self.forks.get_mut(&fork_id) {
             fork.opts.env.evm_env.block_env.number = block_number;
             fork.opts.env.evm_env.block_env.timestamp = block_timestamp;
         }
     }
 
-    fn on_request(&mut self, req: Request) {
+    fn on_request(&mut self, req: Request<N>) {
         match req {
             Request::CreateFork(fork, sender) => self.create_fork(*fork, sender),
             Request::GetFork(fork_id, sender) => {
@@ -323,7 +349,8 @@ impl MultiForkHandler {
                     opts.evm_opts.fork_block_number = Some(block);
                     self.create_fork(opts, sender)
                 } else {
-                    let _ = sender.send(Err(eyre::eyre!("No matching fork exits for {}", fork_id)));
+                    let _ =
+                        sender.send(Err(eyre::eyre!("No matching fork exists for {}", fork_id)));
                 }
             }
             Request::GetEnv(fork_id, sender) => {
@@ -331,6 +358,9 @@ impl MultiForkHandler {
             }
             Request::UpdateBlock(fork_id, block_number, block_timestamp) => {
                 self.update_block(fork_id, block_number, block_timestamp);
+            }
+            Request::UpdateEnv(fork_id, block_env) => {
+                self.update_env(fork_id, block_env);
             }
             Request::ShutDown(sender) => {
                 trace!(target: "fork::multi", "received shutdown signal");
@@ -349,18 +379,16 @@ impl MultiForkHandler {
 
 // Drives all handler to completion.
 // This future will finish once all underlying BackendHandler are completed.
-impl Future for MultiForkHandler {
+impl<N: Network> Future for MultiForkHandler<N> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let pin = self.get_mut();
+        let this = self.get_mut();
 
         // Receive new requests.
         loop {
-            match Pin::new(&mut pin.incoming).poll_next(cx) {
-                Poll::Ready(Some(req)) => {
-                    pin.on_request(req);
-                }
+            match this.incoming.poll_next_unpin(cx) {
+                Poll::Ready(Some(req)) => this.on_request(req),
                 Poll::Ready(None) => {
                     // Channel closed, but we still need to drive the fork handlers to completion.
                     trace!(target: "fork::multi", "request channel closed");
@@ -371,23 +399,23 @@ impl Future for MultiForkHandler {
         }
 
         // Advance all tasks.
-        for n in (0..pin.pending_tasks.len()).rev() {
-            let task = pin.pending_tasks.swap_remove(n);
+        for n in (0..this.pending_tasks.len()).rev() {
+            let task = this.pending_tasks.swap_remove(n);
             match task {
                 ForkTask::Create(mut fut, id, sender, additional_senders) => {
                     if let Poll::Ready(resp) = fut.poll_unpin(cx) {
                         match resp {
                             Ok((fork_id, fork, handler)) => {
-                                if let Some(fork) = pin.forks.get(&fork_id).cloned() {
-                                    pin.insert_new_fork(
+                                if let Some(fork) = this.forks.get(&fork_id).cloned() {
+                                    this.insert_new_fork(
                                         fork.inc_senders(fork_id),
                                         fork,
                                         sender,
                                         additional_senders,
                                     );
                                 } else {
-                                    pin.handlers.push((fork_id.clone(), handler));
-                                    pin.insert_new_fork(fork_id, fork, sender, additional_senders);
+                                    this.handlers.push((fork_id.clone(), handler));
+                                    this.insert_new_fork(fork_id, fork, sender, additional_senders);
                                 }
                             }
                             Err(err) => {
@@ -398,7 +426,7 @@ impl Future for MultiForkHandler {
                             }
                         }
                     } else {
-                        pin.pending_tasks.push(ForkTask::Create(
+                        this.pending_tasks.push(ForkTask::Create(
                             fut,
                             id,
                             sender,
@@ -410,33 +438,33 @@ impl Future for MultiForkHandler {
         }
 
         // Advance all handlers.
-        for n in (0..pin.handlers.len()).rev() {
-            let (id, mut handler) = pin.handlers.swap_remove(n);
+        for n in (0..this.handlers.len()).rev() {
+            let (id, mut handler) = this.handlers.swap_remove(n);
             match handler.poll_unpin(cx) {
                 Poll::Ready(_) => {
                     trace!(target: "fork::multi", "fork {:?} completed", id);
                 }
                 Poll::Pending => {
-                    pin.handlers.push((id, handler));
+                    this.handlers.push((id, handler));
                 }
             }
         }
 
-        if pin.handlers.is_empty() && pin.incoming.is_done() {
+        if this.handlers.is_empty() && this.incoming.is_done() {
             trace!(target: "fork::multi", "completed");
             return Poll::Ready(());
         }
 
         // Periodically flush cached RPC state.
-        if pin
+        if this
             .flush_cache_interval
             .as_mut()
             .map(|interval| interval.poll_tick(cx).is_ready())
-            .unwrap_or_default() &&
-            !pin.forks.is_empty()
+            .unwrap_or_default()
+            && !this.forks.is_empty()
         {
             trace!(target: "fork::multi", "tick flushing caches");
-            let forks = pin.forks.values().map(|f| f.backend.clone()).collect::<Vec<_>>();
+            let forks = this.forks.values().map(|f| f.backend.clone()).collect::<Vec<_>>();
             // Flush this on new thread to not block here.
             std::thread::Builder::new()
                 .name("flusher".into())
@@ -452,18 +480,18 @@ impl Future for MultiForkHandler {
 
 /// Tracks the created Fork
 #[derive(Debug, Clone)]
-struct CreatedFork {
+struct CreatedFork<N: Network> {
     /// How the fork was initially created.
     opts: CreateFork,
     /// Copy of the sender.
-    backend: SharedBackend,
+    backend: SharedBackend<N>,
     /// How many consumers there are, since a `SharedBacked` can be used by multiple
     /// consumers.
     num_senders: Arc<AtomicUsize>,
 }
 
-impl CreatedFork {
-    pub fn new(opts: CreateFork, backend: SharedBackend) -> Self {
+impl<N: Network> CreatedFork<N> {
+    pub fn new(opts: CreateFork, backend: SharedBackend<N>) -> Self {
         Self { opts, backend, num_senders: Arc::new(AtomicUsize::new(1)) }
     }
 
@@ -485,20 +513,20 @@ impl CreatedFork {
 /// This type intentionally does not implement `Clone` since it's intended that there's only once
 /// instance.
 #[derive(Debug)]
-struct ShutDownMultiFork {
-    handler: Option<Sender<Request>>,
+struct ShutDownMultiFork<N: Network> {
+    handler: Option<Sender<Request<N>>>,
 }
 
-impl Drop for ShutDownMultiFork {
+impl<N: Network> Drop for ShutDownMultiFork<N> {
     fn drop(&mut self) {
         trace!(target: "fork::multi", "initiating shutdown");
         let (sender, rx) = oneshot_channel();
         let req = Request::ShutDown(sender);
-        if let Some(mut handler) = self.handler.take() {
-            if handler.try_send(req).is_ok() {
-                let _ = rx.recv();
-                trace!(target: "fork::cache", "multifork backend shutdown");
-            }
+        if let Some(mut handler) = self.handler.take()
+            && handler.try_send(req).is_ok()
+        {
+            let _ = rx.recv();
+            trace!(target: "fork::cache", "multifork backend shutdown");
         }
     }
 }
@@ -506,18 +534,14 @@ impl Drop for ShutDownMultiFork {
 /// Creates a new fork.
 ///
 /// This will establish a new `Provider` to the endpoint and return the Fork Backend.
-async fn create_fork(mut fork: CreateFork) -> eyre::Result<(ForkId, CreatedFork, Handler)> {
-    let provider = Arc::new(
-        ProviderBuilder::new(fork.url.as_str())
-            .maybe_max_retry(fork.evm_opts.fork_retries)
-            .maybe_initial_backoff(fork.evm_opts.fork_retry_backoff)
-            .maybe_headers(fork.evm_opts.fork_headers.clone())
-            .compute_units_per_second(fork.evm_opts.get_compute_units_per_second())
-            .build()?,
-    );
+async fn create_fork<N: Network>(
+    mut fork: CreateFork,
+) -> eyre::Result<(ForkId, CreatedFork<N>, BackendHandler<N>)> {
+    let provider = fork.evm_opts.fork_provider_with_url(&fork.url)?;
 
     // Initialise the fork environment.
-    let (env, block) = fork.evm_opts.fork_evm_env(&fork.url).await?;
+    let (env, block) =
+        fork.evm_opts.fork_evm_env_with_provider::<_, N>(&fork.url, &provider).await?;
     fork.env = env;
     let meta = BlockchainDbMeta::new(fork.env.evm_env.block_env.clone(), fork.url.clone());
 
@@ -535,7 +559,7 @@ async fn create_fork(mut fork: CreateFork) -> eyre::Result<(ForkId, CreatedFork,
     let db = BlockchainDb::new(meta, cache_path);
     let (backend, handler) = SharedBackend::new(provider, db, Some(number.into()));
     let fork = CreatedFork::new(fork, backend);
-    let fork_id = ForkId::new(&fork.opts.url, number.into());
+    let fork_id = ForkId::new(&fork.opts.url, Some(number));
 
     Ok((fork_id, fork, handler))
 }

@@ -1,44 +1,74 @@
 //! Implementations of [`Evm`](spec::Group::Evm) cheatcodes.
 
 use crate::{
-    inspector::{Ecx, RecordDebugStepInfo},
     BroadcastableTransaction, Cheatcode, Cheatcodes, CheatcodesExecutor, CheatsCtxt, Error, Result,
     Vm::*,
+    inspector::{Ecx, RecordDebugStepInfo},
 };
 use alloy_consensus::TxEnvelope;
+use alloy_evm::{Evm as _, FromRecoveredTx};
 use alloy_genesis::{Genesis, GenesisAccount};
-use alloy_primitives::{map::HashMap, Address, Bytes, B256, U256};
+use alloy_network::eip2718::EIP4844_TX_TYPE_ID;
+use alloy_primitives::{
+    Address, B256, U256, hex, keccak256,
+    map::{B256Map, HashMap},
+};
 use alloy_rlp::Decodable;
 use alloy_sol_types::SolValue;
-use foundry_common::fs::{read_json_file, write_json_file};
+use foundry_common::{
+    fs::{read_json_file, write_json_file},
+    slot_identifier::{
+        ENCODING_BYTES, ENCODING_DYN_ARRAY, ENCODING_INPLACE, ENCODING_MAPPING, SlotIdentifier,
+        SlotInfo,
+    },
+};
+use foundry_compilers::artifacts::EvmVersion;
 use foundry_evm_core::{
+    ContextExt,
     backend::{DatabaseExt, RevertStateSnapshotAction},
     constants::{CALLER, CHEATCODE_ADDRESS, HARDHAT_CONSOLE_ADDRESS, TEST_CONTRACT_ADDRESS},
-    ContextExt,
+    evm::new_evm_with_inspector,
+    utils::get_blob_base_fee_update_fraction_by_spec_id,
 };
-use foundry_evm_traces::StackSnapshotType;
+use foundry_evm_traces::TraceMode;
+use foundry_primitives::FoundryTxEnvelope;
 use itertools::Itertools;
 use rand::Rng;
 use revm::{
     bytecode::Bytecode,
-    context::{Block, JournalTr},
-    primitives::{hardfork::SpecId, KECCAK_EMPTY},
-    state::Account,
+    context::{Block, JournalTr, TxEnv, result::ExecutionResult},
+    primitives::{KECCAK_EMPTY, hardfork::SpecId},
+    state::{Account, AccountStatus},
 };
 use std::{
-    collections::{btree_map::Entry, BTreeMap},
+    collections::{BTreeMap, HashSet, btree_map::Entry},
     fmt::Display,
     path::Path,
+    str::FromStr,
 };
 
 mod record_debug_step;
-use record_debug_step::{convert_call_trace_to_debug_step, flatten_call_trace};
+use foundry_common::fmt::format_token_raw;
+use foundry_config::evm_spec_id;
+use record_debug_step::{convert_call_trace_ctx_to_debug_step, flatten_call_trace};
 use serde::Serialize;
 
 mod fork;
 pub(crate) mod mapping;
 pub(crate) mod mock;
 pub(crate) mod prank;
+
+/// JSON-serializable log entry for `getRecordedLogsJson`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LogJson {
+    /// The topics of the log, including the signature, if any.
+    topics: Vec<String>,
+    /// The raw data of the log, hex-encoded with 0x prefix.
+    data: String,
+    /// The address of the log's emitter.
+    emitter: String,
+}
 
 /// Records storage slots reads and writes.
 #[derive(Clone, Debug, Default)]
@@ -102,6 +132,11 @@ struct SlotStateDiff {
     previous_value: B256,
     /// Current storage value.
     new_value: B256,
+    /// Storage layout metadata (variable name, type, offset).
+    /// Only present when contract has storage layout output.
+    /// This includes decoded values when available.
+    #[serde(skip_serializing_if = "Option::is_none", flatten)]
+    slot_info: Option<SlotInfo>,
 }
 
 /// Balance diff info.
@@ -114,14 +149,28 @@ struct BalanceDiff {
     new_value: U256,
 }
 
+/// Nonce diff info.
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NonceDiff {
+    /// Initial nonce value.
+    previous_value: u64,
+    /// Current nonce value.
+    new_value: u64,
+}
+
 /// Account state diff info.
 #[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct AccountStateDiffs {
     /// Address label, if any set.
     label: Option<String>,
+    /// Contract identifier from artifact. e.g "src/Counter.sol:Counter"
+    contract: Option<String>,
     /// Account balance changes.
     balance_diff: Option<BalanceDiff>,
+    /// Account nonce changes.
+    nonce_diff: Option<NonceDiff>,
     /// State changes, per slot.
     state_diff: BTreeMap<B256, SlotStateDiff>,
 }
@@ -132,25 +181,62 @@ impl Display for AccountStateDiffs {
         if let Some(label) = &self.label {
             writeln!(f, "label: {label}")?;
         }
+        if let Some(contract) = &self.contract {
+            writeln!(f, "contract: {contract}")?;
+        }
         // Print balance diff if changed.
-        if let Some(balance_diff) = &self.balance_diff {
-            if balance_diff.previous_value != balance_diff.new_value {
-                writeln!(
-                    f,
-                    "- balance diff: {} → {}",
-                    balance_diff.previous_value, balance_diff.new_value
-                )?;
-            }
+        if let Some(balance_diff) = &self.balance_diff
+            && balance_diff.previous_value != balance_diff.new_value
+        {
+            writeln!(
+                f,
+                "- balance diff: {} → {}",
+                balance_diff.previous_value, balance_diff.new_value
+            )?;
+        }
+        // Print nonce diff if changed.
+        if let Some(nonce_diff) = &self.nonce_diff
+            && nonce_diff.previous_value != nonce_diff.new_value
+        {
+            writeln!(f, "- nonce diff: {} → {}", nonce_diff.previous_value, nonce_diff.new_value)?;
         }
         // Print state diff if any.
         if !&self.state_diff.is_empty() {
             writeln!(f, "- state diff:")?;
             for (slot, slot_changes) in &self.state_diff {
-                writeln!(
-                    f,
-                    "@ {slot}: {} → {}",
-                    slot_changes.previous_value, slot_changes.new_value
-                )?;
+                match &slot_changes.slot_info {
+                    Some(slot_info) => {
+                        if let Some(decoded) = &slot_info.decoded {
+                            // Have slot info with decoded values - show decoded values
+                            writeln!(
+                                f,
+                                "@ {slot} ({}, {}): {} → {}",
+                                slot_info.label,
+                                slot_info.slot_type.dyn_sol_type,
+                                format_token_raw(&decoded.previous_value),
+                                format_token_raw(&decoded.new_value)
+                            )?;
+                        } else {
+                            // Have slot info but no decoded values - show raw hex values
+                            writeln!(
+                                f,
+                                "@ {slot} ({}, {}): {} → {}",
+                                slot_info.label,
+                                slot_info.slot_type.dyn_sol_type,
+                                slot_changes.previous_value,
+                                slot_changes.new_value
+                            )?;
+                        }
+                    }
+                    None => {
+                        // No slot info - show raw hex values
+                        writeln!(
+                            f,
+                            "@ {slot}: {} → {}",
+                            slot_changes.previous_value, slot_changes.new_value
+                        )?;
+                    }
+                }
             }
         }
 
@@ -183,9 +269,13 @@ impl Cheatcode for getNonce_1Call {
 impl Cheatcode for loadCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self { target, slot } = *self;
-        ensure_not_precompile!(&target, ccx);
-        ccx.ecx.journaled_state.load_account(target)?;
-        let mut val = ccx.ecx.journaled_state.sload(target, slot.into())?;
+        ccx.ensure_not_precompile(&target)?;
+
+        let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
+        journal.load_account(db, target)?;
+        let mut val = journal
+            .sload(db, target, slot.into(), false)
+            .map_err(|e| fmt_err!("failed to load storage slot: {:?}", e))?;
 
         if val.is_cold && val.data.is_zero() {
             if ccx.state.has_arbitrary_storage(&target) {
@@ -263,13 +353,13 @@ impl Cheatcode for dumpStateCall {
 
         // Do not include system account or empty accounts in the dump.
         let skip = |key: &Address, val: &Account| {
-            key == &CHEATCODE_ADDRESS ||
-                key == &CALLER ||
-                key == &HARDHAT_CONSOLE_ADDRESS ||
-                key == &TEST_CONTRACT_ADDRESS ||
-                key == &ccx.caller ||
-                key == &ccx.state.config.evm_opts.sender ||
-                val.is_empty()
+            key == &CHEATCODE_ADDRESS
+                || key == &CALLER
+                || key == &HARDHAT_CONSOLE_ADDRESS
+                || key == &TEST_CONTRACT_ADDRESS
+                || key == &ccx.caller
+                || key == &ccx.state.config.evm_opts.sender
+                || val.is_empty()
         };
 
         let alloc = ccx
@@ -328,6 +418,22 @@ impl Cheatcode for getRecordedLogsCall {
     }
 }
 
+impl Cheatcode for getRecordedLogsJsonCall {
+    fn apply(&self, state: &mut Cheatcodes) -> Result {
+        let Self {} = self;
+        let logs = state.recorded_logs.replace(Default::default()).unwrap_or_default();
+        let json_logs: Vec<_> = logs
+            .into_iter()
+            .map(|log| LogJson {
+                topics: log.topics.iter().map(|t| format!("{t}")).collect(),
+                data: hex::encode_prefixed(&log.data),
+                emitter: format!("{}", log.emitter),
+            })
+            .collect();
+        Ok(serde_json::to_string(&json_logs)?.abi_encode())
+    }
+}
+
 impl Cheatcode for pauseGasMeteringCall {
     fn apply(&self, state: &mut Cheatcodes) -> Result {
         let Self {} = self;
@@ -362,10 +468,17 @@ impl Cheatcode for lastCallGasCall {
     }
 }
 
+impl Cheatcode for getChainIdCall {
+    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+        let Self {} = self;
+        Ok(U256::from(ccx.ecx.cfg.chain_id).abi_encode())
+    }
+}
+
 impl Cheatcode for chainIdCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self { newChainId } = self;
-        ensure!(*newChainId <= U256::from(u64::MAX), "chain ID must be less than 2^64 - 1");
+        ensure!(*newChainId <= U256::from(u64::MAX), "chain ID must be less than 2^64");
         ccx.ecx.cfg.chain_id = newChainId.to();
         Ok(Default::default())
     }
@@ -395,7 +508,7 @@ impl Cheatcode for difficultyCall {
 impl Cheatcode for feeCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self { newBasefee } = self;
-        ensure!(*newBasefee <= U256::from(u64::MAX), "base fee must be less than 2^64 - 1");
+        ensure!(*newBasefee <= U256::from(u64::MAX), "base fee must be less than 2^64");
         ccx.ecx.block.basefee = newBasefee.saturating_to();
         Ok(Default::default())
     }
@@ -436,6 +549,8 @@ impl Cheatcode for blobhashesCall {
              see EIP-4844: https://eips.ethereum.org/EIPS/eip-4844"
         );
         ccx.ecx.tx.blob_hashes.clone_from(hashes);
+        // force this as 4844 txtype
+        ccx.ecx.tx.tx_type = EIP4844_TX_TYPE_ID;
         Ok(Default::default())
     }
 }
@@ -455,8 +570,7 @@ impl Cheatcode for getBlobhashesCall {
 impl Cheatcode for rollCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self { newHeight } = self;
-        ensure!(*newHeight <= U256::from(u64::MAX), "block height must be less than 2^64 - 1");
-        ccx.ecx.block.number = newHeight.saturating_to();
+        ccx.ecx.block.number = *newHeight;
         Ok(Default::default())
     }
 }
@@ -471,7 +585,7 @@ impl Cheatcode for getBlockNumberCall {
 impl Cheatcode for txGasPriceCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self { newGasPrice } = self;
-        ensure!(*newGasPrice <= U256::from(u64::MAX), "gas price must be less than 2^64 - 1");
+        ensure!(*newGasPrice <= U256::from(u64::MAX), "gas price must be less than 2^64");
         ccx.ecx.tx.gas_price = newGasPrice.saturating_to();
         Ok(Default::default())
     }
@@ -480,8 +594,7 @@ impl Cheatcode for txGasPriceCall {
 impl Cheatcode for warpCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self { newTimestamp } = self;
-        ensure!(*newTimestamp <= U256::from(u64::MAX), "timestamp must be less than 2^64 - 1");
-        ccx.ecx.block.timestamp = newTimestamp.saturating_to();
+        ccx.ecx.block.timestamp = *newTimestamp;
         Ok(Default::default())
     }
 }
@@ -501,8 +614,11 @@ impl Cheatcode for blobBaseFeeCall {
             "`blobBaseFee` is not supported before the Cancun hard fork; \
              see EIP-4844: https://eips.ethereum.org/EIPS/eip-4844"
         );
-        let is_prague = ccx.ecx.cfg.spec >= SpecId::PRAGUE;
-        ccx.ecx.block.set_blob_excess_gas_and_price((*newBlobBaseFee).to(), is_prague);
+
+        ccx.ecx.block.set_blob_excess_gas_and_price(
+            (*newBlobBaseFee).to(),
+            get_blob_base_fee_update_fraction_by_spec_id(ccx.ecx.cfg.spec),
+        );
         Ok(Default::default())
     }
 }
@@ -528,11 +644,12 @@ impl Cheatcode for dealCall {
 impl Cheatcode for etchCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self { target, newRuntimeBytecode } = self;
-        ensure_not_precompile!(target, ccx);
-        ccx.ecx.journaled_state.load_account(*target)?;
-        let bytecode = Bytecode::new_raw_checked(Bytes::copy_from_slice(newRuntimeBytecode))
+        ccx.ensure_not_precompile(target)?;
+        let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
+        journal.load_account(db, *target)?;
+        let bytecode = Bytecode::new_raw_checked(newRuntimeBytecode.clone())
             .map_err(|e| fmt_err!("failed to create bytecode: {e}"))?;
-        ccx.ecx.journaled_state.set_code(*target, bytecode);
+        journal.set_code(*target, bytecode);
         Ok(Default::default())
     }
 }
@@ -580,10 +697,12 @@ impl Cheatcode for setNonceUnsafeCall {
 impl Cheatcode for storeCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self { target, slot, value } = *self;
-        ensure_not_precompile!(&target, ccx);
-        // ensure the account is touched
-        let _ = journaled_account(ccx.ecx, target)?;
-        ccx.ecx.journaled_state.sstore(target, slot.into(), value.into())?;
+        ccx.ensure_not_precompile(&target)?;
+        ensure_loaded_account(ccx.ecx, target)?;
+        let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
+        journal
+            .sstore(db, target, slot.into(), value.into(), false)
+            .map_err(|e| fmt_err!("failed to store storage slot: {:?}", e))?;
         Ok(Default::default())
     }
 }
@@ -801,6 +920,8 @@ impl Cheatcode for startStateDiffRecordingCall {
     fn apply(&self, state: &mut Cheatcodes) -> Result {
         let Self {} = self;
         state.recorded_account_diffs_stack = Some(Default::default());
+        // Enable mapping recording to track mapping slot accesses
+        state.mapping_slots.get_or_insert_default();
         Ok(Default::default())
     }
 }
@@ -813,9 +934,9 @@ impl Cheatcode for stopAndReturnStateDiffCall {
 }
 
 impl Cheatcode for getStateDiffCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let mut diffs = String::new();
-        let state_diffs = get_recorded_state_diffs(state);
+        let state_diffs = get_recorded_state_diffs(ccx);
         for (address, state_diffs) in state_diffs {
             diffs.push_str(&format!("{address}\n"));
             diffs.push_str(&format!("{state_diffs}\n"));
@@ -825,9 +946,102 @@ impl Cheatcode for getStateDiffCall {
 }
 
 impl Cheatcode for getStateDiffJsonCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
-        let state_diffs = get_recorded_state_diffs(state);
+    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+        let state_diffs = get_recorded_state_diffs(ccx);
         Ok(serde_json::to_string(&state_diffs)?.abi_encode())
+    }
+}
+
+impl Cheatcode for getStorageSlotsCall {
+    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+        let Self { target, variableName } = self;
+
+        let storage_layout = get_contract_data(ccx, *target)
+            .and_then(|(_, data)| data.storage_layout.as_ref().map(|layout| layout.clone()))
+            .ok_or_else(|| fmt_err!("Storage layout not available for contract at {target}. Try compiling contracts with `--extra-output storageLayout`"))?;
+
+        trace!(storage = ?storage_layout.storage, "fetched storage");
+
+        let variable_name_lower = variableName.to_lowercase();
+        let storage = storage_layout
+            .storage
+            .iter()
+            .find(|s| s.label.to_lowercase() == variable_name_lower)
+            .ok_or_else(|| fmt_err!("variable '{variableName}' not found in storage layout"))?;
+
+        let storage_type = storage_layout
+            .types
+            .get(&storage.storage_type)
+            .ok_or_else(|| fmt_err!("storage type not found for variable {variableName}"))?;
+
+        if storage_type.encoding == ENCODING_MAPPING || storage_type.encoding == ENCODING_DYN_ARRAY
+        {
+            return Err(fmt_err!(
+                "cannot get storage slots for variables with mapping or dynamic array types"
+            ));
+        }
+
+        let slot = U256::from_str(&storage.slot).map_err(|_| {
+            fmt_err!("invalid slot {} format for variable {variableName}", storage.slot)
+        })?;
+
+        let mut slots = Vec::new();
+
+        // Always push the base slot
+        slots.push(slot);
+
+        if storage_type.encoding == ENCODING_INPLACE {
+            // For inplace encoding, calculate the number of slots needed
+            let num_bytes = U256::from_str(&storage_type.number_of_bytes).map_err(|_| {
+                fmt_err!(
+                    "invalid number_of_bytes {} for variable {variableName}",
+                    storage_type.number_of_bytes
+                )
+            })?;
+            let num_slots = num_bytes.div_ceil(U256::from(32));
+
+            // Start from 1 since base slot is already added
+            for i in 1..num_slots.to::<usize>() {
+                slots.push(slot + U256::from(i));
+            }
+        }
+
+        if storage_type.encoding == ENCODING_BYTES {
+            // Try to check if it's a long bytes/string by reading the current storage
+            // value
+            let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
+            if let Ok(value) = journal.sload(db, *target, slot, false) {
+                let value_bytes = value.data.to_be_bytes::<32>();
+                let length_byte = value_bytes[31];
+                // Check if it's a long bytes/string (LSB is 1)
+                if length_byte & 1 == 1 {
+                    // Calculate data slots for long bytes/string
+                    let length: U256 = value.data >> 1;
+                    let num_data_slots = length.to::<usize>().div_ceil(32);
+                    let data_start = U256::from_be_bytes(keccak256(B256::from(slot).0).0);
+
+                    for i in 0..num_data_slots {
+                        slots.push(data_start + U256::from(i));
+                    }
+                }
+            }
+        }
+
+        Ok(slots.abi_encode())
+    }
+}
+
+impl Cheatcode for getStorageAccessesCall {
+    fn apply(&self, state: &mut Cheatcodes) -> Result {
+        let mut storage_accesses = Vec::new();
+
+        if let Some(recorded_diffs) = &state.recorded_account_diffs_stack {
+            for account_accesses in recorded_diffs.iter().flatten() {
+                storage_accesses.extend(account_accesses.storageAccesses.clone());
+            }
+        }
+
+        Ok(storage_accesses.abi_encode())
     }
 }
 
@@ -858,7 +1072,7 @@ impl Cheatcode for broadcastRawTransactionCall {
 impl Cheatcode for setBlockhashCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self { blockNumber, blockHash } = *self;
-        ensure!(blockNumber <= U256::from(u64::MAX), "blockNumber must be less than 2^64 - 1");
+        ensure!(blockNumber <= U256::from(u64::MAX), "blockNumber must be less than 2^64");
         ensure!(
             blockNumber <= U256::from(ccx.ecx.block.number),
             "block number must be less than or equal to the current block number"
@@ -870,10 +1084,151 @@ impl Cheatcode for setBlockhashCall {
     }
 }
 
+impl Cheatcode for executeTransactionCall {
+    fn apply_full(&self, ccx: &mut CheatsCtxt, executor: &mut dyn CheatcodesExecutor) -> Result {
+        use crate::env::FORGE_CONTEXT;
+
+        // Block in script contexts.
+        if let Some(ctx) = FORGE_CONTEXT.get()
+            && *ctx == ForgeContext::ScriptGroup
+        {
+            return Err(fmt_err!("executeTransaction is not allowed in forge script"));
+        }
+
+        // Decode the RLP-encoded signed transaction.
+        let tx = FoundryTxEnvelope::decode(&mut self.rawTx.as_ref())
+            .map_err(|err| fmt_err!("failed to decode RLP-encoded transaction: {err}"))?;
+
+        // Reject unsupported transaction types.
+        // TODO: add support for OP deposit transactions.
+        if matches!(tx, FoundryTxEnvelope::Deposit(_)) {
+            return Err(fmt_err!(
+                "OP deposit transactions are not yet supported by executeTransaction"
+            ));
+        }
+        // TODO: add support for Tempo AA transactions.
+        if matches!(tx, FoundryTxEnvelope::Tempo(_)) {
+            return Err(fmt_err!("Tempo transactions are not yet supported by executeTransaction"));
+        }
+
+        // Recover signer from the transaction signature.
+        let sender = tx.recover().map_err(|err| fmt_err!("failed to recover signer: {err}"))?;
+
+        // Build TxEnv from the recovered transaction.
+        let tx_env = <TxEnv as FromRecoveredTx<FoundryTxEnvelope>>::from_recovered_tx(&tx, sender);
+
+        // Mark as inner context so isolation mode doesn't trigger a nested transact_inner
+        // when the inner EVM executes calls at depth == 1.
+        executor.set_in_inner_context(true, Some(sender));
+
+        let res = {
+            let mut inspector = executor.get_inspector(ccx.state);
+
+            let res = {
+                let (db, journal, env) = ccx.ecx.as_db_env_and_journal();
+                let cached_env =
+                    foundry_evm_core::Env::from(env.cfg.clone(), env.block.clone(), env.tx.clone());
+
+                // Override env for isolated execution.
+                env.block.basefee = 0;
+                *env.tx = tx_env;
+                env.tx.gas_price = 0;
+                env.tx.gas_priority_fee = None;
+
+                // Enable nonce checks for realistic simulation.
+                env.cfg.disable_nonce_check = false;
+
+                // EIP-3860: enforce initcode size limit.
+                env.cfg.limit_contract_initcode_size =
+                    Some(revm::primitives::eip3860::MAX_INITCODE_SIZE);
+
+                // Create a new EVM instance with the inspector.
+                let mut evm = new_evm_with_inspector(db, env.to_owned(), &mut *inspector);
+
+                // Clone journaled state and mark all accounts/slots cold.
+                evm.journaled_state.state = {
+                    let mut state = journal.state.clone();
+                    for (addr, acc_mut) in &mut state {
+                        if journal.warm_addresses.is_cold(addr) {
+                            acc_mut.mark_cold();
+                        }
+                        for slot_mut in acc_mut.storage.values_mut() {
+                            slot_mut.is_cold = true;
+                            slot_mut.original_value = slot_mut.present_value;
+                        }
+                    }
+                    state
+                };
+
+                // Set depth to 1 for proper trace collection.
+                evm.journaled_state.depth = 1;
+
+                let res = evm.transact(env.tx.clone());
+
+                // Restore the original environment.
+                *env.tx = cached_env.tx;
+                *env.cfg = cached_env.evm_env.cfg_env;
+                env.block.basefee = cached_env.evm_env.block_env.basefee;
+
+                res
+            };
+
+            // Inspector must be dropped before we can call set_in_inner_context again.
+            drop(inspector);
+            res
+        };
+
+        // Reset inner context flag.
+        executor.set_in_inner_context(false, None);
+
+        let res = res.map_err(|e| fmt_err!("transaction execution failed: {e}"))?;
+
+        // Merge state changes back into the parent journaled state.
+        for (addr, mut acc) in res.state {
+            let Some(acc_mut) = ccx.ecx.journaled_state.state.get_mut(&addr) else {
+                ccx.ecx.journaled_state.state.insert(addr, acc);
+                continue;
+            };
+
+            // Preserve warm account status from parent context.
+            if acc.status.contains(AccountStatus::Cold)
+                && !acc_mut.status.contains(AccountStatus::Cold)
+            {
+                acc.status -= AccountStatus::Cold;
+            }
+            acc_mut.info = acc.info;
+            acc_mut.status |= acc.status;
+
+            // Merge storage changes.
+            for (key, val) in acc.storage {
+                let Some(slot_mut) = acc_mut.storage.get_mut(&key) else {
+                    acc_mut.storage.insert(key, val);
+                    continue;
+                };
+                slot_mut.present_value = val.present_value;
+                slot_mut.is_cold &= val.is_cold;
+            }
+        }
+
+        // Return output bytes.
+        let output = match res.result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            ExecutionResult::Halt { reason, .. } => {
+                return Err(fmt_err!("transaction halted: {reason:?}"));
+            }
+            ExecutionResult::Revert { output, .. } => {
+                return Err(fmt_err!("transaction reverted: {}", hex::encode_prefixed(&output)));
+            }
+        };
+
+        Ok(output.abi_encode())
+    }
+}
+
 impl Cheatcode for startDebugTraceRecordingCall {
     fn apply_full(&self, ccx: &mut CheatsCtxt, executor: &mut dyn CheatcodesExecutor) -> Result {
-        let Some(tracer) = executor.tracing_inspector().and_then(|t| t.as_mut()) else {
-            return Err(Error::from("no tracer initiated, consider adding -vvv flag"))
+        let Some(tracer) = executor.tracing_inspector() else {
+            return Err(Error::from("no tracer initiated, consider adding -vvv flag"));
         };
 
         let mut info = RecordDebugStepInfo {
@@ -883,13 +1238,8 @@ impl Cheatcode for startDebugTraceRecordingCall {
             original_tracer_config: *tracer.config(),
         };
 
-        // turn on tracer configuration for recording
-        tracer.update_config(|config| {
-            config
-                .set_steps(true)
-                .set_memory_snapshots(true)
-                .set_stack_snapshots(StackSnapshotType::Full)
-        });
+        // turn on tracer debug configuration for recording
+        *tracer.config_mut() = TraceMode::Debug.into_config().expect("cannot be None");
 
         // track where the recording starts
         if let Some(last_node) = tracer.traces().nodes().last() {
@@ -903,12 +1253,12 @@ impl Cheatcode for startDebugTraceRecordingCall {
 
 impl Cheatcode for stopAndReturnDebugTraceRecordingCall {
     fn apply_full(&self, ccx: &mut CheatsCtxt, executor: &mut dyn CheatcodesExecutor) -> Result {
-        let Some(tracer) = executor.tracing_inspector().and_then(|t| t.as_mut()) else {
-            return Err(Error::from("no tracer initiated, consider adding -vvv flag"))
+        let Some(tracer) = executor.tracing_inspector() else {
+            return Err(Error::from("no tracer initiated, consider adding -vvv flag"));
         };
 
         let Some(record_info) = ccx.state.record_debug_steps_info else {
-            return Err(Error::from("nothing recorded"))
+            return Err(Error::from("nothing recorded"));
         };
 
         // Use the trace nodes to flatten the call trace
@@ -916,7 +1266,7 @@ impl Cheatcode for stopAndReturnDebugTraceRecordingCall {
         let steps = flatten_call_trace(0, root, record_info.start_node_idx);
 
         let debug_steps: Vec<DebugStep> =
-            steps.iter().map(|&step| convert_call_trace_to_debug_step(step)).collect();
+            steps.iter().map(|step| convert_call_trace_ctx_to_debug_step(step)).collect();
         // Free up memory by clearing the steps if they are not recorded outside of cheatcode usage.
         if !record_info.original_tracer_config.record_steps {
             tracer.traces_mut().nodes_mut().iter_mut().for_each(|node| {
@@ -936,8 +1286,27 @@ impl Cheatcode for stopAndReturnDebugTraceRecordingCall {
     }
 }
 
+impl Cheatcode for setEvmVersionCall {
+    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+        let Self { evm } = self;
+        let spec_id = evm_spec_id(
+            EvmVersion::from_str(evm)
+                .map_err(|_| Error::from(format!("invalid evm version {evm}")))?,
+        );
+        ccx.state.execution_evm_version = Some(spec_id);
+        Ok(Default::default())
+    }
+}
+
+impl Cheatcode for getEvmVersionCall {
+    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+        Ok(ccx.ecx.cfg.spec.to_string().to_lowercase().abi_encode())
+    }
+}
+
 pub(super) fn get_nonce(ccx: &mut CheatsCtxt, address: &Address) -> Result {
-    let account = ccx.ecx.journaled_state.load_account(*address)?;
+    let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
+    let account = journal.load_account(db, *address)?;
     Ok(account.info.nonce.abi_encode())
 }
 
@@ -1017,8 +1386,7 @@ fn inner_start_gas_snapshot(
     name: Option<String>,
 ) -> Result {
     // Revert if there is an active gas snapshot as we can only have one active snapshot at a time.
-    if ccx.state.gas_metering.active_gas_snapshot.is_some() {
-        let (group, name) = ccx.state.gas_metering.active_gas_snapshot.as_ref().unwrap().clone();
+    if let Some((group, name)) = &ccx.state.gas_metering.active_gas_snapshot {
         bail!("gas snapshot was already started with group: {group} and name: {name}");
     }
 
@@ -1044,10 +1412,9 @@ fn inner_stop_gas_snapshot(
     name: Option<String>,
 ) -> Result {
     // If group and name are not provided, use the last snapshot group and name.
-    let (group, name) = group.zip(name).unwrap_or_else(|| {
-        let (group, name) = ccx.state.gas_metering.active_gas_snapshot.as_ref().unwrap().clone();
-        (group, name)
-    });
+    let (group, name) = group
+        .zip(name)
+        .unwrap_or_else(|| ccx.state.gas_metering.active_gas_snapshot.clone().unwrap());
 
     if let Some(record) = ccx
         .state
@@ -1076,10 +1443,11 @@ fn inner_stop_gas_snapshot(
             .retain(|record| record.group != group && record.name != name);
 
         // Clear last snapshot cache if we have an exact match.
-        if let Some((snapshot_group, snapshot_name)) = &ccx.state.gas_metering.active_gas_snapshot {
-            if snapshot_group == &group && snapshot_name == &name {
-                ccx.state.gas_metering.active_gas_snapshot = None;
-            }
+        if let Some((snapshot_group, snapshot_name)) = &ccx.state.gas_metering.active_gas_snapshot
+            && snapshot_group == &group
+            && snapshot_name == &name
+        {
+            ccx.state.gas_metering.active_gas_snapshot = None;
         }
 
         Ok(value.abi_encode())
@@ -1152,9 +1520,15 @@ pub(super) fn journaled_account<'a>(
     ecx: Ecx<'a, '_, '_>,
     addr: Address,
 ) -> Result<&'a mut Account> {
-    ecx.journaled_state.load_account(addr)?;
-    ecx.journaled_state.touch(addr);
+    ensure_loaded_account(ecx, addr)?;
     Ok(ecx.journaled_state.state.get_mut(&addr).expect("account is loaded"))
+}
+
+pub(super) fn ensure_loaded_account(ecx: Ecx, addr: Address) -> Result<()> {
+    let (db, journal, _) = ecx.as_db_env_and_journal();
+    journal.load_account(db, addr)?;
+    journal.touch(addr);
+    Ok(())
 }
 
 /// Consumes recorded account accesses and returns them as an abi encoded
@@ -1193,15 +1567,49 @@ fn genesis_account(account: &Account) -> GenesisAccount {
 }
 
 /// Helper function to returns state diffs recorded for each changed account.
-fn get_recorded_state_diffs(state: &mut Cheatcodes) -> BTreeMap<Address, AccountStateDiffs> {
+fn get_recorded_state_diffs(ccx: &mut CheatsCtxt) -> BTreeMap<Address, AccountStateDiffs> {
     let mut state_diffs: BTreeMap<Address, AccountStateDiffs> = BTreeMap::default();
-    if let Some(records) = &state.recorded_account_diffs_stack {
+
+    // First, collect all unique addresses we need to look up
+    let mut addresses_to_lookup = HashSet::new();
+    if let Some(records) = &ccx.state.recorded_account_diffs_stack {
+        for account_access in records.iter().flatten() {
+            if !account_access.storageAccesses.is_empty()
+                || account_access.oldBalance != account_access.newBalance
+            {
+                addresses_to_lookup.insert(account_access.account);
+                for storage_access in &account_access.storageAccesses {
+                    if storage_access.isWrite && !storage_access.reverted {
+                        addresses_to_lookup.insert(storage_access.account);
+                    }
+                }
+            }
+        }
+    }
+
+    // Look up contract names and storage layouts for all addresses
+    let mut contract_names = HashMap::new();
+    let mut storage_layouts = HashMap::new();
+    for address in addresses_to_lookup {
+        if let Some((artifact_id, contract_data)) = get_contract_data(ccx, address) {
+            contract_names.insert(address, artifact_id.identifier());
+
+            // Also get storage layout if available
+            if let Some(storage_layout) = &contract_data.storage_layout {
+                storage_layouts.insert(address, storage_layout.clone());
+            }
+        }
+    }
+
+    // Now process the records
+    if let Some(records) = &ccx.state.recorded_account_diffs_stack {
         records
             .iter()
             .flatten()
             .filter(|account_access| {
-                !account_access.storageAccesses.is_empty() ||
-                    account_access.oldBalance != account_access.newBalance
+                !account_access.storageAccesses.is_empty()
+                    || account_access.oldBalance != account_access.newBalance
+                    || account_access.oldNonce != account_access.newNonce
             })
             .for_each(|account_access| {
                 // Record account balance diffs.
@@ -1209,7 +1617,8 @@ fn get_recorded_state_diffs(state: &mut Cheatcodes) -> BTreeMap<Address, Account
                     let account_diff =
                         state_diffs.entry(account_access.account).or_insert_with(|| {
                             AccountStateDiffs {
-                                label: state.labels.get(&account_access.account).cloned(),
+                                label: ccx.state.labels.get(&account_access.account).cloned(),
+                                contract: contract_names.get(&account_access.account).cloned(),
                                 ..Default::default()
                             }
                         });
@@ -1224,25 +1633,100 @@ fn get_recorded_state_diffs(state: &mut Cheatcodes) -> BTreeMap<Address, Account
                     }
                 }
 
+                // Record account nonce diffs.
+                if account_access.oldNonce != account_access.newNonce {
+                    let account_diff =
+                        state_diffs.entry(account_access.account).or_insert_with(|| {
+                            AccountStateDiffs {
+                                label: ccx.state.labels.get(&account_access.account).cloned(),
+                                contract: contract_names.get(&account_access.account).cloned(),
+                                ..Default::default()
+                            }
+                        });
+                    // Update nonce diff. Do not overwrite the initial nonce if already set.
+                    if let Some(diff) = &mut account_diff.nonce_diff {
+                        diff.new_value = account_access.newNonce;
+                    } else {
+                        account_diff.nonce_diff = Some(NonceDiff {
+                            previous_value: account_access.oldNonce,
+                            new_value: account_access.newNonce,
+                        });
+                    }
+                }
+
+                // Collect all storage accesses for this account
+                let raw_changes_by_slot = account_access
+                    .storageAccesses
+                    .iter()
+                    .filter_map(|access| {
+                        (access.isWrite && !access.reverted)
+                            .then_some((access.slot, (access.previousValue, access.newValue)))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+
                 // Record account state diffs.
                 for storage_access in &account_access.storageAccesses {
                     if storage_access.isWrite && !storage_access.reverted {
                         let account_diff = state_diffs
                             .entry(storage_access.account)
                             .or_insert_with(|| AccountStateDiffs {
-                                label: state.labels.get(&storage_access.account).cloned(),
+                                label: ccx.state.labels.get(&storage_access.account).cloned(),
+                                contract: contract_names.get(&storage_access.account).cloned(),
                                 ..Default::default()
                             });
+                        let layout = storage_layouts.get(&storage_access.account);
                         // Update state diff. Do not overwrite the initial value if already set.
-                        match account_diff.state_diff.entry(storage_access.slot) {
+                        let entry = match account_diff.state_diff.entry(storage_access.slot) {
                             Entry::Vacant(slot_state_diff) => {
+                                // Get storage layout info for this slot
+                                // Include mapping slots if available for the account
+                                let mapping_slots = ccx
+                                    .state
+                                    .mapping_slots
+                                    .as_ref()
+                                    .and_then(|slots| slots.get(&storage_access.account));
+
+                                let slot_info = layout.and_then(|layout| {
+                                    let decoder = SlotIdentifier::new(layout.clone());
+                                    decoder.identify(&storage_access.slot, mapping_slots).or_else(
+                                        || {
+                                            // Create a map of new values for bytes/string
+                                            // identification. These values are used to determine
+                                            // the length of the data which helps determine how many
+                                            // slots to search
+                                            let current_base_slot_values = raw_changes_by_slot
+                                                .iter()
+                                                .map(|(slot, (_, new_val))| (*slot, *new_val))
+                                                .collect::<B256Map<_>>();
+                                            decoder.identify_bytes_or_string(
+                                                &storage_access.slot,
+                                                &current_base_slot_values,
+                                            )
+                                        },
+                                    )
+                                });
+
                                 slot_state_diff.insert(SlotStateDiff {
                                     previous_value: storage_access.previousValue,
                                     new_value: storage_access.newValue,
-                                });
+                                    slot_info,
+                                })
                             }
-                            Entry::Occupied(mut slot_state_diff) => {
-                                slot_state_diff.get_mut().new_value = storage_access.newValue;
+                            Entry::Occupied(slot_state_diff) => {
+                                let entry = slot_state_diff.into_mut();
+                                entry.new_value = storage_access.newValue;
+                                entry
+                            }
+                        };
+
+                        // Update decoded values if we have slot info
+                        if let Some(slot_info) = &mut entry.slot_info {
+                            slot_info.decode_values(entry.previous_value, storage_access.newValue);
+                            if slot_info.is_bytes_or_string() {
+                                slot_info.decode_bytes_or_string_values(
+                                    &storage_access.slot,
+                                    &raw_changes_by_slot,
+                                );
                             }
                         }
                     }
@@ -1252,11 +1736,62 @@ fn get_recorded_state_diffs(state: &mut Cheatcodes) -> BTreeMap<Address, Account
     state_diffs
 }
 
+/// EIP-1967 implementation storage slot
+const EIP1967_IMPL_SLOT: &str = "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+
+/// EIP-1822 UUPS implementation storage slot: keccak256("PROXIABLE")
+const EIP1822_PROXIABLE_SLOT: &str =
+    "c5f16f0fcc639fa48a6947836d9850f504798523bf8c9a3a87d5876cf622bcf7";
+
+/// Helper function to get the contract data from the deployed code at an address.
+fn get_contract_data<'a>(
+    ccx: &'a mut CheatsCtxt,
+    address: Address,
+) -> Option<(&'a foundry_compilers::ArtifactId, &'a foundry_common::contracts::ContractData)> {
+    // Check if we have available artifacts to match against
+    let artifacts = ccx.state.config.available_artifacts.as_ref()?;
+
+    // Try to load the account and get its code
+    let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
+    let account = journal.load_account(db, address).ok()?;
+    let code = account.info.code.as_ref()?;
+
+    // Skip if code is empty
+    if code.is_empty() {
+        return None;
+    }
+
+    // Try to find the artifact by deployed code
+    let code_bytes = code.original_bytes();
+    // First check for proxy patterns
+    let hex_str = hex::encode(&code_bytes);
+    let find_by_suffix =
+        |suffix: &str| artifacts.iter().find(|(a, _)| a.identifier().ends_with(suffix));
+    // Simple proxy detection based on storage slot patterns
+    if hex_str.contains(EIP1967_IMPL_SLOT)
+        && let Some(result) = find_by_suffix(":TransparentUpgradeableProxy")
+    {
+        return Some(result);
+    } else if hex_str.contains(EIP1822_PROXIABLE_SLOT)
+        && let Some(result) = find_by_suffix(":UUPSUpgradeable")
+    {
+        return Some(result);
+    }
+
+    // Try exact match
+    if let Some(result) = artifacts.find_by_deployed_code_exact(&code_bytes) {
+        return Some(result);
+    }
+
+    // Fallback to fuzzy matching if exact match fails
+    artifacts.find_by_deployed_code(&code_bytes)
+}
+
 /// Helper function to set / unset cold storage slot of the target address.
 fn set_cold_slot(ccx: &mut CheatsCtxt, target: Address, slot: U256, cold: bool) {
-    if let Some(account) = ccx.ecx.journaled_state.state.get_mut(&target) {
-        if let Some(storage_slot) = account.storage.get_mut(&slot) {
-            storage_slot.is_cold = cold;
-        }
+    if let Some(account) = ccx.ecx.journaled_state.state.get_mut(&target)
+        && let Some(storage_slot) = account.storage.get_mut(&slot)
+    {
+        storage_slot.is_cold = cold;
     }
 }

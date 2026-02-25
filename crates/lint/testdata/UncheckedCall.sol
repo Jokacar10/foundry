@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.18;
 
 contract UncheckedCall {
+    event CallResult(bool, bytes);
 
     // SHOULD PASS: Properly checked low-level calls
     function checkedCallWithTuple(address target, bytes memory data) public {
@@ -41,8 +42,8 @@ contract UncheckedCall {
     // Edge case: pre-existing variable assignment
     bool success;
     function checkWithExistingVar(address target) public {
-        (bool, ) = target.call("");
-        (bool, existingData) = target.call("");
+        (success, ) = target.call("");
+        // (success, existingData) = target.call("");
     }
 
     // Edge case: send and transfer are not low-level calls (they automatically revert on failure)
@@ -80,7 +81,7 @@ contract UncheckedCall {
         // Only capturing data, not checking success
     }
 
-    bytes memory existingData;
+    bytes existingData;
     function ignoredReturnExistingVar(address target) public {
         (, existingData) = target.call(""); //~WARN: Low-level calls should check the success return value
     }
