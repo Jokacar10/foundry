@@ -83,7 +83,7 @@ fn fork_bal_cache_keeps_final_zero_and_system_writes() {
 
     let bal = vec![account];
     validate_bal(&bal, 2, None).unwrap();
-    cache(&db, bal);
+    cache_bal(&db, bal);
 
     let storage = db.storage.read();
     assert_eq!(storage[&address][&slot], U256::ZERO);
@@ -101,7 +101,7 @@ fn fork_bal_cache_leaves_partial_accounts_and_reads_unknown() {
 
     let bal = vec![account];
     validate_bal(&bal, 1, None).unwrap();
-    cache(&db, bal);
+    cache_bal(&db, bal);
 
     assert!(db.accounts.read().is_empty());
     assert!(db.storage.read().is_empty());
@@ -129,19 +129,21 @@ fn fork_bal_cache_preserves_cached_values_and_merges_slots() {
 
     let bal = vec![account];
     validate_bal(&bal, 1, None).unwrap();
-    cache(&db, bal);
+    for _ in 0..2 {
+        cache_bal(&db, bal.clone());
 
-    assert_eq!(db.accounts.read()[&address], cached_account);
-    assert_eq!(
-        db.storage.read()[&address],
-        [
-            (U256::from(1), U256::from(101)),
-            (U256::from(2), U256::from(22)),
-            (U256::from(3), U256::from(303)),
-        ]
-        .into_iter()
-        .collect()
-    );
+        assert_eq!(db.accounts.read()[&address], cached_account);
+        assert_eq!(
+            db.storage.read()[&address],
+            [
+                (U256::from(1), U256::from(101)),
+                (U256::from(2), U256::from(22)),
+                (U256::from(3), U256::from(303)),
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
 }
 
 #[test]
@@ -157,7 +159,7 @@ fn fork_bal_cache_preserves_delegation_code_and_final_clearing() {
 
     let bal = vec![complete_account(authority, delegation.clone()), cleared_account];
     validate_bal(&bal, 2, None).unwrap();
-    cache(&db, bal);
+    cache_bal(&db, bal);
 
     let accounts = db.accounts.read();
     let account = &accounts[&authority];
@@ -294,7 +296,7 @@ async fn fork_bal_prepare_requires_immutable_source_before_and_after_bal() {
 }
 
 #[tokio::test]
-async fn fork_bal_prepare_uses_legacy_rpc_only_for_method_not_found() {
+async fn fork_bal_prepare_ends_on_bal_errors() {
     let resolved = resolved(context());
     let block = block(&resolved, 0);
     for code in [-32601, -32603] {
@@ -302,13 +304,11 @@ async fn fork_bal_prepare_uses_legacy_rpc_only_for_method_not_found() {
         rpc_error(&asserter, -32601);
         rpc_error(&asserter, code);
         asserter.push_success(&BlockAccessList::new());
-        rpc_error(&asserter, -32601);
         let provider =
             ProviderBuilder::<_, _, AnyNetwork>::default().connect_mocked_client(asserter.clone());
 
-        let bal = prepare(&provider, &resolved, &block).await;
-        assert_eq!(bal.is_some(), code == -32601);
-        assert_eq!(asserter.read_q().len(), if code == -32601 { 0 } else { 2 });
+        assert!(prepare(&provider, &resolved, &block).await.is_none());
+        assert_eq!(asserter.read_q().len(), 1, "code: {code}");
     }
 }
 
@@ -341,7 +341,7 @@ fn fork_bal_cache_keeps_empty_block_post_execution_writes() {
     let db = MemDb::default();
 
     validate_bal(&bal, 0, None).unwrap();
-    cache(&db, bal);
+    cache_bal(&db, bal);
 
     assert_eq!(db.storage.read()[&address][&U256::ONE], U256::from(42));
     assert!(db.accounts.read().is_empty());

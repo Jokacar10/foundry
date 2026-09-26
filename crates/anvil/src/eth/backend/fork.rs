@@ -3,7 +3,7 @@
 use crate::eth::{backend::db::Db, error::BlockchainError};
 use alloy_chains::NamedChain;
 use alloy_consensus::{BlockHeader, TrieAccount};
-use alloy_eips::{eip2930::AccessListResult, eip7928::BlockAccessList};
+use alloy_eips::eip2930::AccessListResult;
 use alloy_network::{
     AnyNetwork, AnyRpcBlock, BlockResponse, Network, TransactionResponse,
     primitives::HeaderResponse,
@@ -18,7 +18,7 @@ use alloy_provider::{
 };
 use alloy_rpc_types::{
     BlockId, BlockNumberOrTag as BlockNumber, BlockTransactions, EIP1186AccountProofResponse,
-    FeeHistory, Filter, Index, Log,
+    FeeHistory, Filter, FilterBlockOption, FilterSet, Index, Log,
     request::TransactionRequest,
     simulate::{SimulatePayload, SimulatedBlock},
     state::StateOverride,
@@ -38,7 +38,7 @@ use alloy_transport::TransportError;
 use foundry_common::provider::{RetryProvider, is_rpc_method_not_found};
 use foundry_evm::{
     backend::{AccountFetchPolicy, BlockchainDb, account_fetch_policy_for_source},
-    fork::{cache_bal_accounts, cache_bal_storage, validate_bal},
+    fork::{cache_bal, validate_bal},
     hardfork::FoundryHardfork,
 };
 use foundry_evm_networks::{NetworkConfigs, NetworkVariant};
@@ -277,14 +277,15 @@ impl<N: Network> ClientFork<N> {
     }
 
     pub async fn logs(&self, filter: &Filter) -> Result<Vec<Log>, TransportError> {
-        if let Some(logs) = self.storage_read().logs.get(filter).cloned() {
+        let key = LogsCacheKey::from(filter);
+        if let Some(logs) = self.storage_read().logs.get(&key).cloned() {
             return Ok(logs);
         }
 
         let logs = self.provider().get_logs(filter).await?;
 
         let mut storage = self.storage_write();
-        storage.logs.insert(filter.clone(), logs.clone());
+        storage.logs.insert(key, logs.clone());
         Ok(logs)
     }
 
@@ -987,17 +988,11 @@ impl ClientForkConfig {
         }
 
         let prefill = async {
-            let bal = match self
-                .provider
-                .raw_request("eth_getBlockAccessList".into(), (self.block_hash,))
-                .await
-            {
-                Err(error) if is_rpc_method_not_found(&error) => {
-                    self.provider.get_block_access_list_by_hash(self.block_hash).await
-                }
-                response => response,
+            let Some(bal) =
+                self.provider.get_block_access_list(BlockId::hash(self.block_hash)).await?
+            else {
+                return Ok(());
             };
-            let Some(bal) = bal? else { return Ok(()) };
             let Some(block) = self.provider.get_block(BlockId::hash(self.block_hash)).await? else {
                 return Ok(());
             };
@@ -1014,7 +1009,7 @@ impl ClientForkConfig {
                 Err(error) if is_rpc_method_not_found(&error) => {}
                 _ => return Ok(()),
             }
-            cache_bal(db, bal);
+            cache_bal(db.db(), bal);
             Ok::<_, eyre::Report>(())
         };
         // Include retries and validation RPCs in the optional startup budget.
@@ -1024,14 +1019,6 @@ impl ClientForkConfig {
             Err(_) => debug!(target: "node", "fork BAL prefill timed out"),
         }
     }
-}
-
-/// Inserts validated post-state without inventing missing account fields or read-only slot values.
-fn cache_bal(db: &BlockchainDb, bal: BlockAccessList) {
-    let mut storage = db.storage().write();
-    let mut accounts = db.accounts().write();
-    cache_bal_accounts(&mut accounts, &bal);
-    cache_bal_storage(&mut storage, &bal);
 }
 
 #[cfg(test)]
@@ -1048,7 +1035,7 @@ pub struct ForkedStorage<N: Network = AnyNetwork> {
     pub transactions: FbHashMap<32, N::TransactionResponse>,
     pub transaction_receipts: FbHashMap<32, FoundryTxReceipt>,
     pub transaction_traces: FbHashMap<32, Vec<Trace>>,
-    pub logs: HashMap<Filter, Vec<Log>>,
+    pub logs: HashMap<LogsCacheKey, Vec<Log>>,
     pub geth_transaction_traces: FbHashMap<32, Vec<(GethDebugTracingOptions, GethTrace)>>,
     pub geth_block_traces: FbHashMap<32, Vec<(GethDebugTracingOptions, Vec<TraceResult>)>>,
     pub block_traces: HashMap<u64, Vec<Trace>>,
@@ -1081,4 +1068,31 @@ impl<N: Network> ForkedStorage<N> {
         // simply replace with a completely new, empty instance
         *self = Self::default()
     }
+}
+
+/// Cache key for a log [`Filter`].
+///
+/// [`Filter`] is not hashable because its address and topic sets iterate in arbitrary order, so
+/// the key stores them sorted.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LogsCacheKey {
+    block_option: FilterBlockOption,
+    address: Vec<Address>,
+    topics: [Vec<B256>; 4],
+}
+
+impl From<&Filter> for LogsCacheKey {
+    fn from(filter: &Filter) -> Self {
+        Self {
+            block_option: filter.block_option,
+            address: sorted_filter_set(&filter.address),
+            topics: filter.topics.each_ref().map(sorted_filter_set),
+        }
+    }
+}
+
+fn sorted_filter_set<T: Copy + Ord + std::hash::Hash>(set: &FilterSet<T>) -> Vec<T> {
+    let mut values = set.iter().copied().collect::<Vec<_>>();
+    values.sort_unstable();
+    values
 }

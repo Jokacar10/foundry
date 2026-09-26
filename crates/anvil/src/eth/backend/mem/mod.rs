@@ -19,7 +19,9 @@ use crate::{
             fork::{ClientFork, ForkEndpointIdentity},
             genesis::GenesisConfig,
             mem::{
-                state::{state_root, state_trie_witness, storage_root, trie_accounts},
+                state::{
+                    StateRootCache, state_root, state_trie_witness, storage_root, trie_accounts,
+                },
                 storage::MinedTransactionReceipt,
             },
             notifications::{ChainNotification, ChainNotifications, NewBlockNotification},
@@ -1199,6 +1201,11 @@ impl<N: Network> Backend<N> {
         self.mining.lock().await
     }
 
+    /// Locks block production with a guard that can be moved into a mining task.
+    pub(crate) async fn lock_mining_owned(self: &Arc<Self>) -> tokio::sync::OwnedMutexGuard<()> {
+        self.mining.clone().lock_owned().await
+    }
+
     /// Returns the `AccountInfo` from the database
     pub async fn get_account(&self, address: Address) -> DatabaseResult<AccountInfo> {
         Ok(self.db.read().await.basic_ref(address)?.unwrap_or_default())
@@ -1560,6 +1567,17 @@ impl<N: Network> Backend<N> {
         }
 
         precompiles_map
+    }
+
+    /// Returns whether the address is an active precompile in the given block environment.
+    pub fn is_precompile(&self, address: &Address, block_env: &BlockEnv) -> bool {
+        let mut evm_env = self.evm_env.read().clone();
+        evm_env.block_env = block_env.clone();
+        let mut precompiles = PrecompilesMap::from_static(Precompiles::new(
+            PrecompileSpecId::from_spec_id(self.spec_id()),
+        ));
+        self.inject_precompiles(&mut precompiles, &evm_env);
+        precompiles.get(address).is_some()
     }
 
     /// Returns the system contracts for the current spec.
@@ -4239,8 +4257,9 @@ impl<N: Network> Backend<N> {
         filter: TraceFilter,
     ) -> Result<Vec<LocalizedTransactionTrace>, BlockchainError> {
         let matcher = filter.matcher();
-        let start = filter.from_block.unwrap_or(0);
-        let end = filter.to_block.unwrap_or_else(|| self.best_number());
+        let best_number = self.best_number();
+        let start = filter.from_block.unwrap_or(best_number);
+        let end = filter.to_block.unwrap_or(best_number);
 
         if start > end {
             return Err(BlockchainError::RpcError(RpcError::invalid_params(
@@ -5543,6 +5562,14 @@ where
         pool_transactions: Vec<Arc<PoolTransaction<FoundryTxEnvelope>>>,
     ) -> Result<MinedBlockOutcome<FoundryTxEnvelope>, BlockchainError> {
         self.do_mine_block(pool_transactions).await
+    }
+
+    /// Mines a new block while the caller holds the mining lock.
+    pub(crate) async fn mine_block_locked(
+        &self,
+        pool_transactions: Vec<Arc<PoolTransaction<FoundryTxEnvelope>>>,
+    ) -> Result<MinedBlockOutcome<FoundryTxEnvelope>, BlockchainError> {
+        self.do_mine_block_locked(pool_transactions).await
     }
 
     /// Replays a transaction-hash fork prefix before the live pool and miner are created.
@@ -8153,6 +8180,7 @@ impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> Backend<N> {
             storage.hashes.insert(number, hash);
             storage.best_number = number;
             storage.best_hash = hash;
+            storage.hashes.retain(|block_number, _| *block_number <= number);
         }
 
         #[cfg(feature = "monad")]
@@ -8546,6 +8574,9 @@ impl Backend<FoundryNetwork> {
             let mut cache_db = BalDatabase::new(CacheDB::new(state));
             cache_db.cache.block_hashes.insert(U256::from(base_number), base_hash);
             let mut block_res = Vec::with_capacity(block_state_calls.len());
+            // A single block cannot amortize building an incremental trie.
+            let cache_state_roots = block_state_calls.len() > 1;
+            let mut state_root_cache = None::<(StateRootCache, AddressMap<DbAccount>)>;
             let mut parent_hash = base_hash;
             let mut next_base_fee = base_fee;
             let mut inherited_block_env = base_block_env;
@@ -9079,10 +9110,39 @@ impl Backend<FoundryNetwork> {
                 };
 
                 // Fork databases are partial, so their synthetic blocks use a zero state root.
-                let state_root = cache_db
-                    .maybe_full_db()
-                    .map(|accounts| state_root(&accounts))
-                    .unwrap_or_default();
+                let incremental = state_root_cache.as_mut().is_some_and(|(cache, previous)| {
+                    cache.record_overlay(&cache_db.cache.accounts, previous)
+                });
+                let state_root = if incremental {
+                    let (cache, previous) = state_root_cache.as_mut().unwrap();
+                    let root = cache.root(&cache_db.cache.accounts);
+                    previous.clone_from(&cache_db.cache.accounts);
+                    root
+                } else {
+                    cache_db
+                        .maybe_full_db()
+                        .map(|accounts| {
+                            // A deleted base account can retain storage written by
+                            // anvil_setStorageAt. A later touch exposes it in the full merge,
+                            // although it has no trie leaf. Keep the full rebuild in that case.
+                            if cache_state_roots
+                                && accounts.values().all(|account| {
+                                    account.account_state != AccountState::NotExisting
+                                        || account.storage.is_empty()
+                                })
+                            {
+                                let (cache, previous) =
+                                    state_root_cache.get_or_insert_with(Default::default);
+                                let root = cache.root(&accounts);
+                                previous.clone_from(&cache_db.cache.accounts);
+                                root
+                            } else {
+                                state_root_cache = None;
+                                state_root(&accounts)
+                            }
+                        })
+                        .unwrap_or_default()
+                };
                 let block_access_list_hash = cache_db
                     .bal_state
                     .take_built_alloy_bal()
